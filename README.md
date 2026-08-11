@@ -61,11 +61,11 @@ docs/
 cp .env.example .env          # fill in real secrets before anything but local dev
 docker compose up -d --build  # postgres, redis, clamav, api
 docker compose exec api alembic upgrade head
-curl http://localhost:8010/health/live
-curl http://localhost:8010/health/ready
+curl http://localhost:8000/health/live
+curl http://localhost:8000/health/ready
 ```
 
-`.env.example` documents every environment variable the application needs (database, Redis, JWT/CSRF secrets, storage paths, Whish, email, captcha, observability). Note that on this machine ports `8000`, `5432`, `6379`, and `3310` are already in use by an unrelated local project, so `docker-compose.yml` publishes `api`/`postgres`/`redis`/`clamav` on `8010`/`5442`/`6389`/`3320` instead — adjust back to the standard ports in `docker-compose.yml` if that conflict doesn't apply to you.
+`.env.example` documents every environment variable the application needs (database, Redis, JWT/CSRF secrets, storage paths, Whish, email, captcha, observability). Note that on this machine host port `5432` is already in use by a native Windows PostgreSQL service (not Docker), so `docker-compose.yml` publishes `postgres` on `5442` instead — change it back to `"5432:5432"` once that conflict is resolved. `api`/`redis`/`clamav` use their standard ports (`8000`/`6379`/`3310`).
 
 For local Python tooling (ruff, mypy, pytest) outside Docker:
 

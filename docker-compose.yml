@@ -8,8 +8,9 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      # Host 5432 is already taken by an unrelated local project (order-service);
-      # mapped to 5442 here. Change back to "5432:5432" if that port frees up.
+      # Host 5432 is taken by a native Windows PostgreSQL service (postgres.exe),
+      # not a Docker container; mapped to 5442 here until that's resolved.
+      # Change back to "5432:5432" once that service is stopped or reconfigured.
       - "5442:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -23,9 +24,7 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      # Host 6379 is already taken by an unrelated local project (order-service);
-      # mapped to 6389 here. Change back to "6379:6379" if that port frees up.
-      - "6389:6379"
+      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -36,9 +35,7 @@ services:
     image: clamav/clamav:stable
     restart: unless-stopped
     ports:
-      # Host 3310 is already taken by an unrelated local project (order-service);
-      # mapped to 3320 here. Change back to "3310:3310" if that port frees up.
-      - "3320:3310"
+      - "3310:3310"
     volumes:
       - clamav_defs:/var/lib/clamav
     healthcheck:
@@ -65,9 +62,7 @@ services:
         "--reload",
       ]
     ports:
-      # Host 8000 is already taken by an unrelated local project (order-service);
-      # mapped to 8010 here. Change back to "8000:8000" if that port frees up.
-      - "8010:8000"
+      - "8000:8000"
     volumes:
       - ./src:/app/src
       - ./storage/stl_private:/data/stl_private
