@@ -9,7 +9,7 @@ from app.core.config import get_settings
 
 
 @pytest.mark.integration
-def test_health_reports_ok_when_db_and_redis_are_reachable() -> None:
+def test_readiness_reports_ok_when_db_and_redis_are_reachable() -> None:
     with (
         PostgresContainer("postgres:16", driver="asyncpg") as postgres,
         RedisContainer("redis:7-alpine") as redis_server,
@@ -24,9 +24,12 @@ def test_health_reports_ok_when_db_and_redis_are_reachable() -> None:
         from app.main import app
 
         with TestClient(app) as client:
-            response = client.get("/health")
+            response = client.get("/health/ready")
 
         assert response.status_code == 200
-        assert response.json() == {"status": "ok"}
+        body = response.json()
+        assert body["status"] == "ok"
+        assert "version" in body
+        assert "commit" in body
 
         get_settings.cache_clear()

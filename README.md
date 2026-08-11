@@ -7,7 +7,7 @@ Backend for Bekaa3D, a dual-commerce platform for a Lebanese 3D-printing busines
 
 ## Status
 
-Pre-development. The requirements and architecture are specified and approved; no application code has been written yet (`src/`, `tests/`, and `migrations/` are placeholders). Build order follows the phased plan in the SRS — see [Build Phases](docs/SRS.md#28-build-phases).
+In development, following the vertical-slice plan in [`docs/requirments/vertical-slice-plan.md`](docs/requirments/vertical-slice-plan.md). VS-001 (bootable API, migration baseline, health/readiness, request correlation) is merged; each later slice adds one complete, tested, end-to-end capability. Build order follows the phased plan in the SRS — see [Build Phases](docs/SRS.md#28-build-phases).
 
 ## Documentation
 
@@ -43,7 +43,7 @@ Architectural style: Clean Architecture (domain → application → infrastructu
 ## Project Layout
 
 ```
-src/                   # application code (src/bekaa3d/, per pyproject.toml)
+src/                   # application code (src/app/, per pyproject.toml)
 tests/                 # unit, integration, contract, e2e, concurrency, security tests
 migrations/            # Alembic migrations
 docs/
@@ -55,9 +55,50 @@ docs/
 
 ## Getting Started
 
-Application code, Docker Compose services, and setup instructions have not been added yet. Once Phase 0 lands, this section will cover local setup (Docker Compose services, database migrations, running the API and worker).
+### Bootstrap
 
-In the meantime: `.env.example` documents the environment variables the application will require (database, Redis, JWT/CSRF secrets, storage paths, Whish, email, captcha, observability).
+```
+cp .env.example .env          # fill in real secrets before anything but local dev
+docker compose up -d --build  # postgres, redis, clamav, api
+docker compose exec api alembic upgrade head
+curl http://localhost:8010/health/live
+curl http://localhost:8010/health/ready
+```
+
+`.env.example` documents every environment variable the application needs (database, Redis, JWT/CSRF secrets, storage paths, Whish, email, captcha, observability). Note that on this machine ports `8000`, `5432`, `6379`, and `3310` are already in use by an unrelated local project, so `docker-compose.yml` publishes `api`/`postgres`/`redis`/`clamav` on `8010`/`5442`/`6389`/`3320` instead — adjust back to the standard ports in `docker-compose.yml` if that conflict doesn't apply to you.
+
+For local Python tooling (ruff, mypy, pytest) outside Docker:
+
+```
+python -m venv .venv
+source .venv/Scripts/activate   # .venv/bin/activate on Linux/macOS
+pip install -e ".[dev]"
+ruff check . && ruff format --check . && mypy src && pytest
+```
+
+### Health endpoints
+
+Both live outside `/api/v1` (they're operational, not business API) and never require authentication:
+
+- `GET /health/live` — process liveness only. Never probes the database or Redis; a slow dependency must never make an orchestrator kill a healthy process. Always `200` if the process is running.
+- `GET /health/ready` — checks the dependencies this instance actually needs (Postgres, Redis). Returns `200` with `{"status": "ok", "version", "commit"}` when ready, or a `503` RFC 9457 problem response when a dependency is unreachable. Never includes secrets.
+
+### Migrations
+
+```
+docker compose exec api alembic upgrade head        # apply
+docker compose exec api alembic revision -m "..."    # new empty revision
+```
+
+Migrations run against `DATABASE_URL` from the environment. Alembic is configured for SQLAlchemy's async engine (`migrations/env.py`), so no separate sync driver is needed.
+
+### Request correlation and logging
+
+Every request gets a stable ID (`X-Request-ID`): the incoming header value if the caller supplies one, otherwise a generated `req_<uuid4hex>`. It's echoed back as a response header and bound into every structured log line for that request, and it appears as `request_id` in every error response body. Logs are structured via `structlog` — JSON in production, human-readable console output in development (`ENVIRONMENT` setting).
+
+### Error contract
+
+Every non-2xx API response is `application/problem+json` (RFC 9457): `type`, `title`, `status`, `detail`, `instance`, a stable machine-readable `code`, `request_id`, and an `errors` array for field-level validation failures. Clients should branch on `code`, never on `detail` (which is a diagnostic string, not a translation key). See `docs/requirments/api-endpoints.md` §5 for the full stable error-code table.
 
 ## Conventions
 

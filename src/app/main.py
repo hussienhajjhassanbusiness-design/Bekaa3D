@@ -2,15 +2,19 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import redis.asyncio as redis
-from fastapi import FastAPI, Request
-from sqlalchemy import text
+from fastapi import FastAPI
 
+from app.api.errors import register_exception_handlers
+from app.api.health import router as health_router
+from app.api.middleware import RequestIDMiddleware
 from app.core.config import get_settings
 from app.core.database import make_engine
+from app.core.logging import configure_logging
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    configure_logging()
     settings = get_settings()
     app.state.db_engine = make_engine(settings.database_url)
     # redis-py ships py.typed but Redis.from_url itself isn't fully annotated upstream.
@@ -22,10 +26,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
 
 app = FastAPI(title="Bekaa3D API", version="0.1.0", lifespan=lifespan)
 
-
-@app.get("/health")
-async def health(request: Request) -> dict[str, str]:
-    async with request.app.state.db_engine.connect() as conn:
-        await conn.execute(text("SELECT 1"))
-    await request.app.state.redis.ping()
-    return {"status": "ok"}
+app.add_middleware(RequestIDMiddleware)
+register_exception_handlers(app)
+app.include_router(health_router)

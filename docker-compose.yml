@@ -8,7 +8,9 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-      - "5432:5432"
+      # Host 5432 is already taken by an unrelated local project (order-service);
+      # mapped to 5442 here. Change back to "5432:5432" if that port frees up.
+      - "5442:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -21,7 +23,9 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      # Host 6379 is already taken by an unrelated local project (order-service);
+      # mapped to 6389 here. Change back to "6379:6379" if that port frees up.
+      - "6389:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -32,7 +36,9 @@ services:
     image: clamav/clamav:stable
     restart: unless-stopped
     ports:
-      - "3310:3310"
+      # Host 3310 is already taken by an unrelated local project (order-service);
+      # mapped to 3320 here. Change back to "3310:3310" if that port frees up.
+      - "3320:3310"
     volumes:
       - clamav_defs:/var/lib/clamav
     healthcheck:

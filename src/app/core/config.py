@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     environment: str = "development"
     debug: bool = False
     base_url: str = "http://localhost:8000"
+    app_version: str = "0.1.0"
+    git_commit_sha: str = "unknown"
 
     database_url: str
     redis_url: str
