@@ -1,0 +1,78 @@
+# nginx is deliberately omitted until the protected-download (STL entitlement) slice
+# lands - see docs/adr for the X-Accel-Redirect design. Same for the arq worker and
+# scheduler services: they have nothing to run until the first background job exists.
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  clamav:
+    image: clamav/clamav:stable
+    restart: unless-stopped
+    ports:
+      - "3310:3310"
+    volumes:
+      - clamav_defs:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s # first boot downloads virus definitions
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command:
+      [
+        "uvicorn",
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--app-dir",
+        "src",
+        "--reload",
+      ]
+    ports:
+      # Host 8000 is already taken by an unrelated local project (order-service);
+      # mapped to 8010 here. Change back to "8000:8000" if that port frees up.
+      - "8010:8000"
+    volumes:
+      - ./src:/app/src
+      - ./storage/stl_private:/data/stl_private
+      - ./storage/uploads_private:/data/uploads_private
+      - ./storage/media_public:/data/media_public
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  clamav_defs:
