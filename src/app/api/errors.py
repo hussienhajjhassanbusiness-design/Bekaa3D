@@ -7,6 +7,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import JSONResponse
 
 from app.core.config import get_settings
+from app.core.exceptions import ApiError
 
 logger = structlog.get_logger()
 
@@ -32,6 +33,7 @@ def _problem_response(
     title: str,
     detail: str,
     errors: list[dict[str, Any]] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     settings = get_settings()
     body = {
@@ -44,7 +46,9 @@ def _problem_response(
         "request_id": _request_id(request),
         "errors": errors or [],
     }
-    return JSONResponse(status_code=status_code, content=body, media_type=PROBLEM_MEDIA_TYPE)
+    return JSONResponse(
+        status_code=status_code, content=body, media_type=PROBLEM_MEDIA_TYPE, headers=headers
+    )
 
 
 async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -75,6 +79,18 @@ async def validation_exception_handler(request: Request, exc: Exception) -> JSON
     )
 
 
+async def api_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    assert isinstance(exc, ApiError)
+    return _problem_response(
+        request,
+        status_code=exc.status_code,
+        code=exc.code,
+        title=exc.title,
+        detail=exc.detail,
+        headers=exc.headers,
+    )
+
+
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     await logger.aexception("unhandled_exception", path=request.url.path)
     return _problem_response(
@@ -89,4 +105,5 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    app.add_exception_handler(ApiError, api_error_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)

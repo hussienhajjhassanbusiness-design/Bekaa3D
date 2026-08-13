@@ -10,12 +10,9 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from app.core import models as _models  # noqa: F401 - registers models onto Base.metadata
 from app.core.config import get_settings
 from app.core.database import Base
-
-# Import every context's infrastructure.models here once they exist, so
-# Base.metadata is fully populated for autogenerate. Empty in Phase 0 - no
-# ORM models exist yet.
 
 config = context.config
 

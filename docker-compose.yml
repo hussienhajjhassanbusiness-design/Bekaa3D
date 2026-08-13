@@ -1,6 +1,5 @@
 # nginx is deliberately omitted until the protected-download (STL entitlement) slice
-# lands - see docs/adr for the X-Accel-Redirect design. Same for the arq worker and
-# scheduler services: they have nothing to run until the first background job exists.
+# lands - see docs/adr for the X-Accel-Redirect design.
 
 services:
   postgres:
@@ -65,9 +64,30 @@ services:
       - "8000:8000"
     volumes:
       - ./src:/app/src
+      - ./migrations:/app/migrations
       - ./storage/stl_private:/data/stl_private
       - ./storage/uploads_private:/data/uploads_private
       - ./storage/media_public:/data/media_public
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - PYTHONPATH=/app/src
+    command: ["arq", "app.worker.WorkerSettings", "--watch", "src"]
+    # The image's Dockerfile HEALTHCHECK curls /health/live, which only the api
+    # service serves - the worker process has no HTTP server, so that check
+    # would always fail here. Disabled until a real arq-based check is added.
+    healthcheck:
+      disable: true
+    volumes:
+      - ./src:/app/src
     depends_on:
       postgres:
         condition: service_healthy

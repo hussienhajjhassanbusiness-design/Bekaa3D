@@ -64,6 +64,11 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Session-scoped async fixtures (db_engine) share connections across tests;
+# those connections are bound to the event loop they were opened on, so the
+# loop itself must also be session-scoped or asyncpg breaks on Windows.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = [

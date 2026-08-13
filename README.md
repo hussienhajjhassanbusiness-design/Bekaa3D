@@ -7,7 +7,12 @@ Backend for Bekaa3D, a dual-commerce platform for a Lebanese 3D-printing busines
 
 ## Status
 
-In development, following the vertical-slice plan in [`docs/requirments/vertical-slice-plan.md`](docs/requirments/vertical-slice-plan.md). VS-001 (bootable API, migration baseline, health/readiness, request correlation) is merged; each later slice adds one complete, tested, end-to-end capability. Build order follows the phased plan in the SRS — see [Build Phases](docs/SRS.md#28-build-phases).
+In development, following the vertical-slice plan in [`docs/requirments/vertical-slice-plan.md`](docs/requirments/vertical-slice-plan.md). Merged so far:
+
+- **VS-001** — bootable API, migration baseline, health/readiness, request correlation
+- **VS-002** — user registration, email verification, resend, transactional outbox, first worker job
+
+Each slice adds one complete, tested, end-to-end capability. Build order follows the phased plan in the SRS — see [Build Phases](docs/SRS.md#28-build-phases).
 
 ## Documentation
 
@@ -99,6 +104,30 @@ Every request gets a stable ID (`X-Request-ID`): the incoming header value if th
 ### Error contract
 
 Every non-2xx API response is `application/problem+json` (RFC 9457): `type`, `title`, `status`, `detail`, `instance`, a stable machine-readable `code`, `request_id`, and an `errors` array for field-level validation failures. Clients should branch on `code`, never on `detail` (which is a diagnostic string, not a translation key). See `docs/requirments/api-endpoints.md` §5 for the full stable error-code table.
+
+### Background jobs (worker)
+
+The `worker` Compose service runs `arq app.worker.WorkerSettings`, sharing one process for both on-demand jobs and cron schedules (arq's `unique=True` cron default means a schedule only fires once even with multiple worker replicas — see `docs/adr/`). Job functions and their schedules live in `src/app/jobs/registry.py`; each job is a plain coroutine that takes an arq `ctx` dict, so it can be unit-tested by calling it directly with a fake `ctx`.
+
+`dispatch_outbox` (every minute, plus once at worker startup) claims due `email_outbox` rows with `SELECT ... FOR UPDATE SKIP LOCKED` — safe with multiple worker replicas — and hands each to the configured email provider. A provider failure never crashes the batch: the message stays `pending` with exponential backoff until it hits 5 attempts, then moves to `failed` and logs at error level.
+
+Watch it locally:
+
+```
+docker compose logs -f worker
+```
+
+### Registration and email verification (VS-002)
+
+`POST /api/v1/auth/register`, `/verify-email`, and `/resend-verification` are all **enumeration-safe**: the response is identical regardless of whether the email is new, already registered-unverified, or already verified — see `docs/requirments/api-endpoints.md` §8.1. Registration writes the user, verification token, outbox message, and audit-log row in one transaction; the actual email send happens later via the outbox worker, so an email-provider outage never rolls back an account creation.
+
+`EMAIL_PROVIDER=console` (the `.env.example` default) logs the email instead of sending it — grep the `api` or `worker` container logs for `console_email_send` to find a verification link during local development:
+
+```
+docker compose logs api worker | grep console_email_send
+```
+
+The `token` field in that log entry is the raw value to POST to `/api/v1/auth/verify-email`.
 
 ## Conventions
 
