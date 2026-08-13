@@ -18,7 +18,16 @@ Record material architectural decisions in `docs/adr/` as they're made, with rat
 
 ## Project status
 
-Pre-development: `src/`, `tests/`, and `migrations/` are empty. Git has not been initialized yet. Don't assume application code, a database, or Docker services exist until they're actually added — check before referencing them.
+In development. Git is initialized, with a remote at `github.com/hussienhajjhassanbusiness-design/Bekaa3D`. `src/app/`, `tests/`, and `migrations/` are populated — check the current tree rather than assuming emptiness.
+
+Vertical slices merged so far (full plan: `docs/requirments/vertical-slice-plan.md`; kept current in `README.md`'s Status section):
+
+- **VS-001** — bootable API, migration baseline, health/readiness, request correlation
+- **VS-002** — user registration, email verification, resend, transactional outbox, first worker job (identity + platform contexts, email provider port, Redis rate limiting, `dispatch_outbox` arq job)
+
+**Next up: VS-003** — login, logout, refresh rotation, CSRF, session reuse detection.
+
+Local dev stack (`docker-compose.yml`: postgres, redis, clamav, api, worker) — see README's Getting Started section for bootstrap commands and the current port-mapping note (postgres is on host port `5442`, not `5432`, because of a native Windows PostgreSQL service on this machine; that's an open item, not yet resolved).
 
 ## Architecture rules
 
