@@ -24,8 +24,9 @@ Vertical slices merged so far (full plan: `docs/requirments/vertical-slice-plan.
 
 - **VS-001** — bootable API, migration baseline, health/readiness, request correlation
 - **VS-002** — user registration, email verification, resend, transactional outbox, first worker job (identity + platform contexts, email provider port, Redis rate limiting, `dispatch_outbox` arq job)
+- **VS-003** — login, logout, rotating refresh sessions, CSRF, refresh-token reuse detection (`sessions` table, JWT access/refresh cookies, HMAC double-submit CSRF, Redis login throttle, `SELECT ... FOR UPDATE` rotation)
 
-**Next up: VS-003** — login, logout, refresh rotation, CSRF, session reuse detection.
+**Next up: VS-004** — password reset with global session revocation. VS-005 (admin MFA), VS-006 (`GET /api/v1/me`) and VS-008 (notifications) are also unblocked and can run in parallel with it.
 
 Local dev stack (`docker-compose.yml`: postgres, redis, clamav, api, worker) — see README's Getting Started section for bootstrap commands and the current port-mapping note (postgres is on host port `5442`, not `5432`, because of a native Windows PostgreSQL service on this machine; that's an open item, not yet resolved).
 
