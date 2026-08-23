@@ -11,6 +11,7 @@ In development, following the vertical-slice plan in [`docs/requirments/vertical
 
 - **VS-001** — bootable API, migration baseline, health/readiness, request correlation
 - **VS-002** — user registration, email verification, resend, transactional outbox, first worker job
+- **VS-003** — login, logout, rotating refresh sessions, CSRF, refresh-token reuse detection
 
 Each slice adds one complete, tested, end-to-end capability. Build order follows the phased plan in the SRS — see [Build Phases](docs/SRS.md#28-build-phases).
 
@@ -128,6 +129,26 @@ docker compose logs api worker | grep console_email_send
 ```
 
 The `token` field in that log entry is the raw value to POST to `/api/v1/auth/verify-email`.
+
+### Browser sessions (VS-003)
+
+`POST /api/v1/auth/login` sets three cookies and returns `SessionRead`. The tokens are never in the response body.
+
+| Cookie | Contents | Lifetime | `httpOnly` | `Path` |
+| --- | --- | --- | --- | --- |
+| `access_token` | signed JWT: user, session, role, verified flag | `ACCESS_TOKEN_MINUTES` (15) | yes | `/` |
+| `refresh_token` | signed JWT: session id + `token_version` | `REFRESH_TOKEN_DAYS` (30) | yes | `/api/v1/auth` |
+| `csrf_token` | `HMAC(CSRF_SECRET, session_id)` | 30 days | **no** | `/` |
+
+`csrf_token` is deliberately readable by JavaScript: every unsafe cookie-authenticated request must echo its value in the **`X-CSRF-Token`** header, or the request is rejected with `403 CSRF_INVALID`. Because the token is derived from the session id rather than being a random value, a token minted for one session cannot be replayed against another.
+
+`POST /api/v1/auth/refresh` rotates the refresh token, replaces `sessions.refresh_token_hash`, and increments `token_version`. Rotation does **not** extend `expires_at`, so a session always dies on its original deadline.
+
+**Refresh-token reuse detection.** A validly signed refresh token carrying an *older* `token_version` can only be a replay of a token that was already rotated away. That is treated as theft: `reuse_detected_at` and `revoked_at` are both set, the whole session dies, and a fresh login is required. The response is an ordinary `401 AUTH_REQUIRED` — identical to any other rejected token, so an attacker learns nothing.
+
+A consequence worth knowing: two clients sharing one session (for example two browser tabs refreshing at the same instant) will trip this. The row lock guarantees exactly one rotation succeeds, and the loser is indistinguishable from a replay, so it revokes the session. That is the intended strict-rotation trade-off, not a bug.
+
+Repeated login failures are throttled per `(email, IP)`. Thresholds count **attempts**, not failures already recorded: attempts 1–3 are free, attempts 4–7 wait 1s/2s/4s/8s, 8 and 9 stay at the 8s cap, and the 10th attempt is refused outright for 15 minutes (`429 RATE_LIMITED` with `Retry-After: 900`). Counters live in Redis and reset on a successful login.
 
 ## Conventions
 

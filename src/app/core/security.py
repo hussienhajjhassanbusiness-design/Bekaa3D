@@ -1,6 +1,32 @@
 import hashlib
+import hmac
+import secrets
+from uuid import UUID
 
 from app.core.config import get_settings
+
+
+def csrf_token_for_session(session_id: UUID) -> str:
+    """Derive this session's CSRF token as HMAC(CSRF_SECRET, session_id).
+
+    Deriving rather than storing a random value has two benefits: nothing extra
+    to persist, and the token is *bound to the session*. Plain double-submit
+    only checks that cookie and header agree, so an attacker who can write a
+    cookie (e.g. from a compromised subdomain) can set both halves to a value
+    they chose. A bound token defeats that - they cannot forge the HMAC for
+    someone else's session without the server secret."""
+    settings = get_settings()
+    return hmac.new(
+        settings.csrf_secret.encode("utf-8"),
+        str(session_id).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def verify_csrf_token(*, session_id: UUID, presented: str | None) -> bool:
+    if not presented:
+        return False
+    return secrets.compare_digest(presented, csrf_token_for_session(session_id))
 
 
 def hash_ip(ip_address: str) -> str:

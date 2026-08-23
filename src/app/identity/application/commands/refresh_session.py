@@ -1,0 +1,111 @@
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from uuid import UUID
+
+from app.core.security import csrf_token_for_session
+from app.identity.domain.exceptions import (
+    InvalidSessionError,
+    RefreshTokenReuseError,
+    SessionOwnerRevokedError,
+)
+from app.identity.infrastructure.repositories import SessionRepository, UserRepository
+from app.identity.infrastructure.session_tokens import (
+    decode_refresh_token,
+    issue_access_token,
+    issue_refresh_token,
+)
+from app.identity.infrastructure.token_service import hash_token
+from app.platform.infrastructure.repositories import AuditLogRepository
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    session_id: UUID
+    access_token: str
+    refresh_token: str
+    csrf_token: str
+
+
+class RefreshSession:
+    def __init__(
+        self,
+        user_repo: UserRepository,
+        session_repo: SessionRepository,
+        audit_repo: AuditLogRepository,
+    ) -> None:
+        self._users = user_repo
+        self._sessions = session_repo
+        self._audit = audit_repo
+
+    async def execute(
+        self, *, raw_refresh_token: str, request_id: str | None, ip_hash: str | None
+    ) -> RefreshResult:
+        claims = decode_refresh_token(raw_refresh_token)
+
+        # FOR UPDATE. Everything below runs while this row is locked, so two
+        # simultaneous refreshes of the same token serialise here and the
+        # second one correctly sees the first one's rotation.
+        session = await self._sessions.get_for_update(claims.session_id)
+        if session is None:
+            raise InvalidSessionError()
+
+        now = datetime.now(UTC)
+        try:
+            session.authorize_rotation(
+                presented_token_hash=hash_token(raw_refresh_token),
+                presented_version=claims.token_version,
+                at=now,
+            )
+        except RefreshTokenReuseError:
+            # A stolen token was replayed. Kill the session rather than merely
+            # rejecting this request, so the thief cannot keep trying and the
+            # real user is forced through a fresh login.
+            #
+            # The caller MUST commit this before returning the 401 - see the
+            # refresh route, which does so explicitly. Letting the exception
+            # roll the transaction back would leave the stolen session alive.
+            session.mark_reuse_detected(now)
+            await self._sessions.save(session)
+            await self._audit.add(
+                actor_user_id=session.user_id,
+                action="session.reuse_detected",
+                entity_type="Session",
+                entity_id=session.id,
+                request_id=request_id,
+                ip_hash=ip_hash,
+            )
+            raise
+
+        user = await self._users.get_by_id(session.user_id)
+        if user is None or not user.can_authenticate:
+            # Deactivated or anonymised between login and refresh: the session
+            # must not survive its owner. Like the reuse branch above, this
+            # revocation has to be committed by the caller despite the 401.
+            session.revoke(now)
+            await self._sessions.save(session)
+            raise SessionOwnerRevokedError(session.id)
+
+        # rotate() increments token_version itself, so the token is minted for
+        # the version rotate() is about to produce - test_rotate_advances_
+        # version_and_replaces_the_hash is what keeps these two in agreement.
+        refresh_token = issue_refresh_token(
+            session_id=session.id,
+            token_version=session.token_version + 1,
+            expires_at=session.expires_at,
+            now=now,
+        )
+        session.rotate(new_token_hash=hash_token(refresh_token), at=now)
+        await self._sessions.save(session)
+
+        return RefreshResult(
+            session_id=session.id,
+            access_token=issue_access_token(
+                user_id=user.id,
+                session_id=session.id,
+                role=user.role,
+                email_verified=user.is_verified,
+                now=now,
+            ),
+            refresh_token=refresh_token,
+            csrf_token=csrf_token_for_session(session.id),
+        )
