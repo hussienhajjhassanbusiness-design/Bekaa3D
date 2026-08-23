@@ -28,7 +28,19 @@ Vertical slices merged so far (full plan: `docs/requirments/vertical-slice-plan.
 
 **Next up: VS-004** — password reset with global session revocation. VS-005 (admin MFA), VS-006 (`GET /api/v1/me`) and VS-008 (notifications) are also unblocked and can run in parallel with it.
 
-Local dev stack (`docker-compose.yml`: postgres, redis, clamav, api, worker) — see README's Getting Started section for bootstrap commands and the current port-mapping note (postgres is on host port `5442`, not `5432`, because of a native Windows PostgreSQL service on this machine; that's an open item, not yet resolved).
+Local dev stack (`docker-compose.yml`: postgres, redis, clamav, api, worker) — see README's Getting Started section for bootstrap commands and the current port-mapping note.
+
+### Known follow-ups
+
+Small, real, and deliberately deferred — not bugs anyone is mid-way through fixing. Pick them up when touching the surrounding code rather than as standalone work:
+
+- **Postgres host port** — published on `5442`, not `5432`, because a native Windows PostgreSQL service occupies `5432` on the primary dev machine. Revert `docker-compose.yml` to `"5432:5432"` once that's resolved.
+- **Coarse login rate limiter** (`src/app/core/rate_limit.py`) — returns `429` with `RateLimit-*` headers but no `Retry-After`, so clients get no machine-readable wait time. The per-`(email, IP)` login throttle *does* send one; the two disagree. Introduced in VS-002.
+- **Line endings** — no `.gitattributes`, so Git warns `LF will be replaced by CRLF` on every commit from Windows. Harmless with one developer; with two on different platforms it produces whole-file diffs where nothing changed. `* text=auto eol=lf` fixes it, ideally before the second contributor's first commit.
+
+### Local secrets
+
+`.env` is git-ignored and never committed. Copying `.env.example` is not enough — every placeholder in it must be replaced with a locally generated value before the stack is trusted for anything but throwaway data. `IP_HASH_SALT` matters most: it salts IP addresses in `audit_logs` and `sessions`, and the IPv4 space is small enough (~4 billion) that a known salt makes those hashes trivially reversible by brute force. Generate with `python -c "import secrets; print(secrets.token_hex(16))"`. Never paste a real secret into this file, the README, a commit, or a chat.
 
 ## Architecture rules
 
