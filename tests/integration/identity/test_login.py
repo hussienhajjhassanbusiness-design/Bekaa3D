@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.identity.application.services.login_throttle import LOCKOUT_AFTER, LoginThrottle
+from app.identity.application.services.login_throttle import LOCKOUT_AT_ATTEMPT, LoginThrottle
 from app.identity.infrastructure.models import SessionModel, UserModel
 from app.platform.infrastructure.models import AuditLogModel, EmailOutboxModel
 
@@ -215,7 +215,10 @@ async def test_lockout_returns_429_with_retry_after(db_session: AsyncSession) ->
     try:
         with TestClient(app) as client:
             await register_and_verify(client, db_session, email)
-            await redis.set(LoginThrottle._key(email, TEST_CLIENT_IP), LOCKOUT_AFTER)
+            # One short of the threshold, so the request below is exactly the
+            # attempt the lockout is supposed to start at - seeding higher
+            # would pass even if the boundary were off by one.
+            await redis.set(LoginThrottle._key(email, TEST_CLIENT_IP), LOCKOUT_AT_ATTEMPT - 1)
 
             # Even the correct password is refused while locked out.
             response = client.post(

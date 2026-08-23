@@ -148,7 +148,7 @@ The `token` field in that log entry is the raw value to POST to `/api/v1/auth/ve
 
 A consequence worth knowing: two clients sharing one session (for example two browser tabs refreshing at the same instant) will trip this. The row lock guarantees exactly one rotation succeeds, and the loser is indistinguishable from a replay, so it revokes the session. That is the intended strict-rotation trade-off, not a bug.
 
-Repeated login failures are throttled per `(email, IP)`: no delay for the first 3, then 1s/2s/4s/8s, and a 15-minute lockout after 10 (`429 RATE_LIMITED` with `Retry-After`). Counters live in Redis and reset on a successful login.
+Repeated login failures are throttled per `(email, IP)`. Thresholds count **attempts**, not failures already recorded: attempts 1–3 are free, attempts 4–7 wait 1s/2s/4s/8s, 8 and 9 stay at the 8s cap, and the 10th attempt is refused outright for 15 minutes (`429 RATE_LIMITED` with `Retry-After: 900`). Counters live in Redis and reset on a successful login.
 
 ## Conventions
 

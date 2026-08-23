@@ -1,7 +1,7 @@
 import pytest
 
 from app.identity.application.services.login_throttle import (
-    LOCKOUT_AFTER,
+    LOCKOUT_AT_ATTEMPT,
     LOCKOUT_SECONDS,
     LoginThrottle,
     _delay_for,
@@ -32,21 +32,45 @@ class FakeRedis:
 
 
 @pytest.mark.parametrize(
-    ("failures", "expected"),
-    [(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0), (4, 1.0), (5, 2.0), (6, 4.0), (7, 8.0), (20, 8.0)],
+    ("attempt", "expected"),
+    [(1, 0.0), (2, 0.0), (3, 0.0), (4, 1.0), (5, 2.0), (6, 4.0), (7, 8.0), (20, 8.0)],
 )
-def test_delay_curve_matches_the_agreed_policy(failures: int, expected: float) -> None:
-    assert _delay_for(failures) == expected
+def test_delay_curve_matches_the_agreed_policy(attempt: int, expected: float) -> None:
+    assert _delay_for(attempt) == expected
 
 
-async def test_lockout_raises_once_the_threshold_is_reached() -> None:
-    redis = FakeRedis()
-    throttle = LoginThrottle(redis)
-    key = LoginThrottle._key("someone@example.com", "1.2.3.4")
-    redis.values[key] = LOCKOUT_AFTER
+async def test_the_delay_tracks_the_attempt_number_not_the_stored_failure_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for a real off-by-one.
 
+    `_delay_for` was always correct; `check` passed it the number of failures
+    already recorded instead of the number of this attempt. The old unit test
+    only exercised the function, so it stayed green while the endpoint gave
+    away a fourth free guess and locked out one attempt late. This drives the
+    two together, which is where the defect actually lived."""
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(
+        "app.identity.application.services.login_throttle.asyncio.sleep", fake_sleep
+    )
+
+    throttle = LoginThrottle(FakeRedis())
+    email, ip = "someone@example.com", "1.2.3.4"
+
+    for _ in range(LOCKOUT_AT_ATTEMPT - 1):
+        await throttle.check(email=email, ip=ip)
+        await throttle.record_failure(email=email, ip=ip)
+
+    # Attempts 1-3 free, then 1/2/4/8 with 8 as the cap.
+    assert slept == [1.0, 2.0, 4.0, 8.0, 8.0, 8.0]
+
+    # ...and the very next attempt - the 10th - is refused outright.
     with pytest.raises(AccountLockedError) as excinfo:
-        await throttle.check(email="someone@example.com", ip="1.2.3.4")
+        await throttle.check(email=email, ip=ip)
 
     assert excinfo.value.retry_after_seconds == LOCKOUT_SECONDS
 

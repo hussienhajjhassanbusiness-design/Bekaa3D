@@ -15,20 +15,23 @@ from typing import Any
 
 from app.identity.domain.exceptions import AccountLockedError
 
-# First three failures cost nothing - a customer who mistypes twice should not
-# be punished. After that each failure doubles the wait, capped so a request
+# First three attempts cost nothing - a customer who mistypes twice should not
+# be punished. After that each attempt doubles the wait, capped so a request
 # never occupies a worker for long.
+#
+# Every threshold here counts *attempts*, not failures already recorded. The two
+# differ by one, and conflating them is exactly the bug this module once had.
 FREE_ATTEMPTS = 3
 MAX_DELAY_SECONDS = 8.0
-LOCKOUT_AFTER = 10
+LOCKOUT_AT_ATTEMPT = 10
 LOCKOUT_SECONDS = 15 * 60
 
 
-def _delay_for(failures: int) -> float:
-    """4 -> 1s, 5 -> 2s, 6 -> 4s, 7+ -> 8s."""
-    if failures <= FREE_ATTEMPTS:
+def _delay_for(attempt: int) -> float:
+    """Delay before the Nth attempt: 4 -> 1s, 5 -> 2s, 6 -> 4s, 7+ -> 8s."""
+    if attempt <= FREE_ATTEMPTS:
         return 0.0
-    return min(float(2 ** (failures - FREE_ATTEMPTS - 1)), MAX_DELAY_SECONDS)
+    return min(float(2 ** (attempt - FREE_ATTEMPTS - 1)), MAX_DELAY_SECONDS)
 
 
 class LoginThrottle:
@@ -51,11 +54,16 @@ class LoginThrottle:
         would tell an attacker their guess was close."""
         raw = await self._redis.get(self._key(email, ip))
         failures = int(raw) if raw else 0
+        # Redis holds the failures already recorded, so this request is the one
+        # after them. The policy is written in attempt numbers, so convert
+        # before applying it - passing `failures` straight through is what once
+        # granted a fourth free guess and pushed the lockout to attempt 11.
+        attempt = failures + 1
 
-        if failures >= LOCKOUT_AFTER:
+        if attempt >= LOCKOUT_AT_ATTEMPT:
             raise AccountLockedError(retry_after_seconds=LOCKOUT_SECONDS)
 
-        delay = _delay_for(failures)
+        delay = _delay_for(attempt)
         if delay:
             await asyncio.sleep(delay)
 
