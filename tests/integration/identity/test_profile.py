@@ -1,6 +1,8 @@
 import uuid
+from collections.abc import Callable
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -73,15 +75,19 @@ async def test_an_unverified_customer_may_read_their_profile(db_session: AsyncSe
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("configured_app")
-async def test_each_session_only_ever_sees_its_own_profile(db_session: AsyncSession) -> None:
+async def test_each_session_only_ever_sees_its_own_profile(
+    db_session: AsyncSession, make_app: Callable[[], FastAPI]
+) -> None:
     """Ownership (FR-03: "A customer cannot view another customer's profile").
     The subject comes from the signed token, so there is no identifier to
-    tamper with - this proves two live sessions cannot cross over."""
-    from app.main import app
+    tamper with - this proves two live sessions cannot cross over.
 
+    Both clients are open at once, so each needs its own app instance: two
+    lifespans over the shared `app.main.app` singleton overwrite one another's
+    `app.state` and deadlock the first client's next request."""
     first_email = _unique_email()
     second_email = _unique_email()
-    with TestClient(app) as first_client, TestClient(app) as second_client:
+    with TestClient(make_app()) as first_client, TestClient(make_app()) as second_client:
         first_user = await register_and_verify(first_client, db_session, first_email)
         second_user = await register_and_verify(second_client, db_session, second_email)
         _login(first_client, first_email)

@@ -1,12 +1,13 @@
 import asyncio
 import os
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Callable, Generator
 
 import pytest
 import pytest_asyncio
 import redis.asyncio as redis_asyncio
 from alembic import command
 from alembic.config import Config
+from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -72,6 +73,38 @@ async def configured_app(
 
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture
+def make_app() -> Callable[[], FastAPI]:
+    """Builds independent app instances, each with its own `app.state`.
+
+    `app.main.app` is a module-level singleton, so entering two `TestClient`s
+    against it runs two lifespans over one `app.state`: the second overwrites
+    the first's engine and Redis client, and a request through the first client
+    then awaits a connection owned by the second client's event loop and hangs
+    forever. A test holding more than one client open at once must build them
+    from here rather than importing the singleton.
+
+    This mirrors the wiring in `src/app/main.py` - keep the two in step when a
+    router or middleware is added there.
+    """
+
+    def _make() -> FastAPI:
+        from app.api.errors import register_exception_handlers
+        from app.api.health import router as health_router
+        from app.api.middleware import RequestIDMiddleware
+        from app.api.v1.router import router as v1_router
+        from app.main import lifespan
+
+        app = FastAPI(title="Bekaa3D API", version="0.1.0", lifespan=lifespan)
+        app.add_middleware(RequestIDMiddleware)
+        register_exception_handlers(app)
+        app.include_router(health_router)
+        app.include_router(v1_router)
+        return app
+
+    return _make
 
 
 @pytest_asyncio.fixture
