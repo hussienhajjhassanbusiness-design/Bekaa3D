@@ -22,6 +22,7 @@ Only expensive-to-reverse decisions belong here. Folder names and small refactor
 - [ADR-014: Use first-class entitlements and nginx-protected STL delivery](ADR-014-entitlements-and-protected-downloads.md)
 - [ADR-015: Partition downloads and audit logs by month](ADR-015-partition-high-volume-logs.md)
 - [ADR-016: Launch V1 English-only](ADR-016-english-only-v1.md)
+- [ADR-017: Gate admin login on MFA rather than stepping up an existing session](ADR-017-login-gated-admin-mfa.md)
 
 ## Governance
 

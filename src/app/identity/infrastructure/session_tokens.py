@@ -30,6 +30,11 @@ class AccessTokenClaims:
     session_id: UUID
     role: UserRole
     email_verified: bool
+    # Whether this session has cleared the admin second factor (SEC-04). Defaults
+    # to False so anything that predates MFA - an older token still inside its
+    # 15-minute life, or a caller that does not set it - fails closed at the
+    # admin boundary rather than being waved through.
+    mfa_completed: bool = False
 
 
 @dataclass(frozen=True)
@@ -45,6 +50,7 @@ def issue_access_token(
     role: UserRole,
     email_verified: bool,
     now: datetime,
+    mfa_completed: bool = False,
 ) -> str:
     settings = get_settings()
     payload = {
@@ -53,6 +59,7 @@ def issue_access_token(
         "sid": str(session_id),
         "role": role.value,
         "ver": email_verified,
+        "mfa": mfa_completed,
         "iat": now,
         "exp": now + timedelta(minutes=settings.access_token_minutes),
     }
@@ -101,6 +108,9 @@ def decode_access_token(token: str) -> AccessTokenClaims:
             session_id=UUID(payload["sid"]),
             role=UserRole(payload["role"]),
             email_verified=bool(payload["ver"]),
+            # .get, not [...]: a token minted before this claim existed is still
+            # validly signed and must decode, simply without MFA.
+            mfa_completed=bool(payload.get("mfa", False)),
         )
     except (KeyError, ValueError) as exc:
         raise InvalidSessionError() from exc

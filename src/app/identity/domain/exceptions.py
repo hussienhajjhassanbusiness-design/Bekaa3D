@@ -105,3 +105,41 @@ class SessionOwnerRevokedError(SessionTerminatedError):
     def __init__(self, session_id: UUID) -> None:
         super().__init__(f"Owner of session {session_id} can no longer authenticate.")
         self.session_id = session_id
+
+
+class InvalidRecoveryCodeError(IdentityDomainError):
+    """The recovery code is unknown, or it has already been consumed.
+
+    One exception for both, following InvalidVerificationTokenError: telling a
+    caller that a code exists but is spent confirms it was once valid, which is
+    a detail an attacker working through a stolen list should not get. The API
+    surfaces both as the single stable `MFA_INVALID` code."""
+
+
+class MfaNotEnrolledError(IdentityDomainError):
+    """The account has no enabled MFA credential.
+
+    Distinct from a wrong code: nothing was submitted that could have been
+    right. Only ever surfaced to a caller who has already authenticated as the
+    account in question, so it reveals nothing to an outsider."""
+
+
+class MfaAlreadyEnabledError(IdentityDomainError):
+    """Re-enrollment attempted while MFA is already enabled.
+
+    V1 design assumption. database-design.md 5.6 says enrollment may update the
+    credential, but a single `secret_ciphertext` column cannot hold an old and a
+    pending secret at once - so an update would either void the working factor
+    before the replacement is proven, or leave `enabled_at` set against a secret
+    the administrator has not yet confirmed. Both lock the account out of admin.
+    Since SEC-04 also treats disabling MFA as not a normal V1 operation,
+    replacing an enabled factor is refused here and left to an explicit,
+    audited recovery procedure."""
+
+
+class InvalidMfaCodeError(IdentityDomainError):
+    """The submitted TOTP is wrong, malformed, or outside its window.
+
+    One exception for all three: which of them it was is exactly what an
+    attacker probing the endpoint would like to learn. Surfaces as the stable
+    `MFA_INVALID` code."""

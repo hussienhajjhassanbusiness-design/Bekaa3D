@@ -102,7 +102,14 @@ The client does not construct or interpret cursors.
 
 - no authentication → `401 AUTH_REQUIRED`;
 - authenticated non-admin calling an admin route → `404 NOT_FOUND`;
-- admin without completed MFA → `401/403 MFA_REQUIRED` according to login/session state.
+- admin without completed MFA → `401 MFA_REQUIRED`.
+
+The last case arises only for an administrator whose MFA enrollment is not yet
+confirmed. Login is MFA-gated (§8.1, §8.2 and
+[ADR-017](../adr/ADR-017-login-gated-admin-mfa.md)): an administrator with an
+enabled credential receives `202 MfaChallengeRead` and no session at all, so
+they cannot reach an admin route to be challenged. No challenge is issued by
+the admin boundary — the only source of one is `POST /auth/login`.
 
 ---
 

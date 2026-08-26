@@ -12,6 +12,7 @@ In development, following the vertical-slice plan in [`docs/requirments/vertical
 - **VS-001** — bootable API, migration baseline, health/readiness, request correlation
 - **VS-002** — user registration, email verification, resend, transactional outbox, first worker job
 - **VS-003** — login, logout, rotating refresh sessions, CSRF, refresh-token reuse detection
+- **VS-005** — administrator MFA (TOTP), login-gated admin sessions, one-time recovery codes, isolated `/api/v1/admin` boundary
 
 Each slice adds one complete, tested, end-to-end capability. Build order follows the phased plan in the SRS — see [Build Phases](docs/SRS.md#28-build-phases).
 

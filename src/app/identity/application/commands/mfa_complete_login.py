@@ -1,28 +1,39 @@
+"""VS-005: the second half of a login that stopped at the MFA challenge.
+
+api-endpoints.md:270 makes `/auth/mfa/verify` the step that "Completes admin
+login; sets full auth + CSRF cookies". VS-003's `Login` deliberately stops
+before minting a session for an administrator with MFA enabled, so this is
+where that session is finally created.
+
+On the structural similarity to the tail of `Login.execute`: it is intentional
+and it is not a parallel session mechanism. Both build a session out of exactly
+the same primitives - `SessionRepository.add`, `issue_refresh_token`,
+`issue_access_token`, `csrf_token_for_session`, `hash_token` - and both write
+the same `user.logged_in` audit row, so a session is a session however it was
+reached. Reusing the primitives rather than refactoring VS-003's login into a
+shared helper is a deliberate scope choice: VS-005 owns this file, and VS-003's
+login keeps the shape its own author gave it.
+
+The one genuine difference is the access token, which carries
+`mfa_completed=True` from the moment it is minted - this session never exists
+in an MFA-incomplete state."""
+
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 from app.core.config import get_settings
 from app.core.security import csrf_token_for_session
-from app.identity.application.services.admin_mfa_gate import AdminMfaGate, MfaChallengeRequired
-from app.identity.application.services.login_throttle import LoginThrottle
 from app.identity.domain.enums import UserRole
 from app.identity.domain.exceptions import AccountDisabledError, InvalidCredentialsError
-from app.identity.infrastructure.password_hasher import hash_password, verify_password
 from app.identity.infrastructure.repositories import SessionRepository, UserRepository
 from app.identity.infrastructure.session_tokens import issue_access_token, issue_refresh_token
 from app.identity.infrastructure.token_service import hash_token
 from app.platform.infrastructure.repositories import AuditLogRepository
 
-# Argon2 verification is deliberately slow, so skipping it for an unknown email
-# would make "no such account" measurably faster to answer than "wrong
-# password" - an attacker can time that difference and enumerate addresses.
-# Verifying against this throwaway hash keeps both paths equally slow.
-_DUMMY_PASSWORD_HASH = hash_password("timing-equalisation-placeholder")
-
 
 @dataclass(frozen=True)
-class LoginResult:
+class CompleteMfaLoginResult:
     user_id: UUID
     email: str
     session_id: UUID
@@ -34,66 +45,44 @@ class LoginResult:
     csrf_token: str
 
 
-class Login:
+class CompleteMfaLogin:
+    """Create the authenticated session for an account that has just cleared
+    its second factor."""
+
     def __init__(
         self,
         user_repo: UserRepository,
         session_repo: SessionRepository,
         audit_repo: AuditLogRepository,
-        throttle: LoginThrottle,
-        # VS-005 MFA integration.
-        mfa_gate: AdminMfaGate,
     ) -> None:
         self._users = user_repo
         self._sessions = session_repo
         self._audit = audit_repo
-        self._throttle = throttle
-        self._mfa_gate = mfa_gate
 
     async def execute(
         self,
         *,
-        email: str,
-        password: str,
-        ip: str | None,
+        user_id: UUID,
         ip_hash: str | None,
         user_agent: str | None,
         request_id: str | None,
-    ) -> LoginResult | MfaChallengeRequired:
-        await self._throttle.check(email=email, ip=ip)
-
-        user = await self._users.get_by_email(email)
+    ) -> CompleteMfaLoginResult:
+        """`user_id` comes from the resolved challenge, never from the request
+        body - the caller never gets to name the account they are completing
+        login for."""
+        user = await self._users.get_by_id(user_id)
         if user is None:
-            verify_password(password=password, password_hash=_DUMMY_PASSWORD_HASH)
-            await self._throttle.record_failure(email=email, ip=ip)
+            # The account vanished between the password check and the second
+            # factor. Nothing here is a useful signal to an attacker, and the
+            # route maps it to the same MFA_INVALID everything else gets.
             raise InvalidCredentialsError()
 
-        if not verify_password(password=password, password_hash=user.password_hash):
-            await self._throttle.record_failure(email=email, ip=ip)
-            raise InvalidCredentialsError()
-
-        # Only now, after the password has proven the caller owns this account,
-        # is it safe to be specific about why login is refused. Doing this check
-        # before verification would let anyone probe which addresses are
-        # suspended (FR-02: errors must not reveal whether an email exists).
+        # Re-checked rather than assumed: the challenge is valid for five
+        # minutes, and an account can be deactivated inside that window. The
+        # password half of this login already passed the same check, so
+        # skipping it here would make the MFA path the weaker of the two.
         if not user.can_authenticate:
             raise AccountDisabledError(user.id)
-
-        await self._throttle.reset(email=email, ip=ip)
-
-        # ---- VS-005 MFA integration (SEC-04, api-endpoints.md:252) ----------
-        # The password has proven the caller owns this account, but for an
-        # administrator with MFA enabled that is only half of a login. Return
-        # before anything is minted: no session row, no tokens, no cookies, so
-        # a stolen password on its own buys nothing but a five-minute challenge.
-        #
-        # Placed after the throttle reset on purpose - the password *was*
-        # correct, so the failure counters for this (email, IP) should clear
-        # exactly as they would for any other correct password. Everything
-        # above this point is VS-003's original login, unchanged.
-        if await self._mfa_gate.challenge_required(user):
-            return MfaChallengeRequired(user_id=user.id)
-        # ---- end VS-005 MFA integration -------------------------------------
 
         settings = get_settings()
         now = datetime.now(UTC)
@@ -111,6 +100,11 @@ class Login:
             ip_hash=ip_hash,
             user_agent=user_agent,
         )
+        # The same action VS-003 writes for an ordinary login. A session
+        # reached through MFA is still a login, and splitting the audit
+        # vocabulary would make "when did this account sign in?" a two-query
+        # question. What the second factor added is recorded separately by
+        # VerifyMfa as `mfa.verified` / `mfa.recovery_code_used`.
         await self._audit.add(
             actor_user_id=user.id,
             action="user.logged_in",
@@ -120,7 +114,7 @@ class Login:
             ip_hash=ip_hash,
         )
 
-        return LoginResult(
+        return CompleteMfaLoginResult(
             user_id=user.id,
             email=user.email,
             session_id=session_id,
@@ -133,6 +127,9 @@ class Login:
                 role=user.role,
                 email_verified=user.is_verified,
                 now=now,
+                # Born MFA-complete. There is no window in which this session
+                # exists without the claim.
+                mfa_completed=True,
             ),
             refresh_token=refresh_token,
             csrf_token=csrf_token_for_session(session_id),

@@ -1,11 +1,26 @@
+from collections.abc import Sequence
 from datetime import datetime
+from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import CursorResult, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.identity.domain.entities import Session, User, VerificationToken
-from app.identity.infrastructure.models import SessionModel, UserModel, VerificationTokenModel
+from app.identity.domain.entities import (
+    MfaCredential,
+    MfaRecoveryCode,
+    Session,
+    User,
+    VerificationToken,
+)
+from app.identity.domain.enums import MfaMethod
+from app.identity.infrastructure.models import (
+    MfaCredentialModel,
+    MfaRecoveryCodeModel,
+    SessionModel,
+    UserModel,
+    VerificationTokenModel,
+)
 
 # Naming note: `self._session` throughout this module is the SQLAlchemy
 # AsyncSession (the unit of work). `Session` is our own login-session entity.
@@ -50,6 +65,29 @@ def _token_to_domain(model: VerificationTokenModel) -> VerificationToken:
         user_id=model.user_id,
         token_hash=model.token_hash,
         expires_at=model.expires_at,
+        used_at=model.used_at,
+        created_at=model.created_at,
+    )
+
+
+def _mfa_credential_to_domain(model: MfaCredentialModel) -> MfaCredential:
+    return MfaCredential(
+        id=model.id,
+        user_id=model.user_id,
+        method=model.method,
+        secret_ciphertext=bytes(model.secret_ciphertext),
+        enabled_at=model.enabled_at,
+        last_used_at=model.last_used_at,
+        created_at=model.created_at,
+        updated_at=model.updated_at,
+    )
+
+
+def _mfa_recovery_code_to_domain(model: MfaRecoveryCodeModel) -> MfaRecoveryCode:
+    return MfaRecoveryCode(
+        id=model.id,
+        mfa_credential_id=model.mfa_credential_id,
+        code_hash=model.code_hash,
         used_at=model.used_at,
         created_at=model.created_at,
     )
@@ -182,4 +220,117 @@ class VerificationTokenRepository:
         if model is None:
             raise ValueError(f"VerificationToken {token.id} not found")
         model.used_at = token.used_at
+        await self._session.flush()
+
+
+class MfaCredentialRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_by_user_id(self, user_id: UUID) -> MfaCredential | None:
+        stmt = select(MfaCredentialModel).where(MfaCredentialModel.user_id == user_id)
+        model = await self._session.scalar(stmt)
+        return _mfa_credential_to_domain(model) if model else None
+
+    async def add(
+        self, *, user_id: UUID, method: MfaMethod, secret_ciphertext: bytes
+    ) -> MfaCredential:
+        model = MfaCredentialModel(
+            user_id=user_id, method=method, secret_ciphertext=secret_ciphertext
+        )
+        self._session.add(model)
+        await self._session.flush()
+        await self._session.refresh(model)
+        return _mfa_credential_to_domain(model)
+
+    async def save(self, credential: MfaCredential) -> None:
+        model = await self._session.get(MfaCredentialModel, credential.id)
+        if model is None:
+            raise ValueError(f"MfaCredential {credential.id} not found")
+        model.secret_ciphertext = credential.secret_ciphertext
+        model.enabled_at = credential.enabled_at
+        model.last_used_at = credential.last_used_at
+        await self._session.flush()
+
+
+class MfaRecoveryCodeRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_unused_by_hash(
+        self, *, mfa_credential_id: UUID, code_hash: str
+    ) -> MfaRecoveryCode | None:
+        """Find one unused code and hold a row lock until the transaction ends.
+
+        `SELECT ... FOR UPDATE` is what actually makes a recovery code
+        one-time-use. Without it, two requests submitting the same code
+        concurrently both read `used_at IS NULL`, both pass the domain guard in
+        MfaRecoveryCode.redeem, and the code is spent twice - which for a
+        recovery credential means two admin sessions from one stolen code. With
+        the lock, the second transaction blocks here, then re-reads the row the
+        first already marked used and correctly finds nothing."""
+        stmt = (
+            select(MfaRecoveryCodeModel)
+            .where(
+                MfaRecoveryCodeModel.mfa_credential_id == mfa_credential_id,
+                MfaRecoveryCodeModel.code_hash == code_hash,
+                MfaRecoveryCodeModel.used_at.is_(None),
+            )
+            .with_for_update()
+        )
+        model = await self._session.scalar(stmt)
+        return _mfa_recovery_code_to_domain(model) if model else None
+
+    async def add_set(
+        self, *, mfa_credential_id: UUID, code_hashes: Sequence[str]
+    ) -> list[MfaRecoveryCode]:
+        models = [
+            MfaRecoveryCodeModel(mfa_credential_id=mfa_credential_id, code_hash=code_hash)
+            for code_hash in code_hashes
+        ]
+        self._session.add_all(models)
+        await self._session.flush()
+        for model in models:
+            await self._session.refresh(model)
+        return [_mfa_recovery_code_to_domain(model) for model in models]
+
+    async def count_unused(self, mfa_credential_id: UUID) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(MfaRecoveryCodeModel)
+            .where(
+                MfaRecoveryCodeModel.mfa_credential_id == mfa_credential_id,
+                MfaRecoveryCodeModel.used_at.is_(None),
+            )
+        )
+        return (await self._session.scalar(stmt)) or 0
+
+    async def delete_unused(self, mfa_credential_id: UUID) -> int:
+        """Wipe the unused half of a code set, for regeneration.
+
+        Only unused rows are removed. Spent codes stay, because `code_hash` is
+        UNIQUE table-wide and deleting the evidence that a code was already
+        redeemed would let the identical string be issued again later and
+        accepted a second time. Deletion rather than soft-delete is what
+        database-design.md 5.7 calls for ("invalidates/removes prior unused code
+        set"), and these rows carry no audit value - the regeneration event
+        itself is what gets audited."""
+        stmt = (
+            delete(MfaRecoveryCodeModel)
+            .where(
+                MfaRecoveryCodeModel.mfa_credential_id == mfa_credential_id,
+                MfaRecoveryCodeModel.used_at.is_(None),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        # execute() is typed as returning Result; rowcount is a CursorResult
+        # attribute, and a DML statement always produces one.
+        result = cast("CursorResult[Any]", await self._session.execute(stmt))
+        return result.rowcount
+
+    async def save(self, code: MfaRecoveryCode) -> None:
+        model = await self._session.get(MfaRecoveryCodeModel, code.id)
+        if model is None:
+            raise ValueError(f"MfaRecoveryCode {code.id} not found")
+        model.used_at = code.used_at
         await self._session.flush()

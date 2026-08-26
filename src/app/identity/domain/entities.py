@@ -3,9 +3,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
-from app.identity.domain.enums import UserRole
+from app.identity.domain.enums import MfaMethod, UserRole
 from app.identity.domain.exceptions import (
     AlreadyVerifiedError,
+    InvalidRecoveryCodeError,
     InvalidSessionError,
     InvalidVerificationTokenError,
     RefreshTokenReuseError,
@@ -133,3 +134,70 @@ class Session:
         """Stolen-token response: record the detection and kill the session."""
         self.reuse_detected_at = at
         self.revoke(at)
+
+
+@dataclass
+class MfaCredential:
+    """One account's second factor (database-design.md 5.6).
+
+    `secret_ciphertext` is the encrypted TOTP secret and is deliberately typed
+    as opaque bytes: nothing in the domain layer can read it, so no domain rule
+    can accidentally end up logging or returning the raw secret."""
+
+    id: UUID
+    user_id: UUID
+    method: MfaMethod
+    secret_ciphertext: bytes
+    enabled_at: datetime | None
+    last_used_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+    @property
+    def is_enabled(self) -> bool:
+        """Enrollment alone does not grant admin access - only confirmation
+        does. Everything gating the admin boundary must ask this, never merely
+        whether a credential row exists."""
+        return self.enabled_at is not None
+
+    def enable(self, at: datetime) -> None:
+        """Called only once a real TOTP has been verified against the enrolled
+        secret. Re-confirming an already-enabled credential keeps the original
+        timestamp, so this records when MFA was first trusted rather than when
+        it was last exercised - `last_used_at` is what tracks the latter."""
+        if not self.is_enabled:
+            self.enabled_at = at
+        self.updated_at = at
+
+    def mark_used(self, at: datetime) -> None:
+        self.last_used_at = at
+        self.updated_at = at
+
+
+@dataclass
+class MfaRecoveryCode:
+    """A single one-time recovery code (database-design.md 5.7).
+
+    Only the hash is held here; the plaintext exists solely in the response
+    that generated it and in whatever the administrator wrote down."""
+
+    id: UUID
+    mfa_credential_id: UUID
+    code_hash: str
+    used_at: datetime | None
+    created_at: datetime
+
+    @property
+    def is_used(self) -> bool:
+        return self.used_at is not None
+
+    def redeem(self, at: datetime) -> None:
+        """Consume this code, or refuse if it is already spent.
+
+        The guard is what makes the code one-time-use in the domain, but it is
+        not on its own sufficient under concurrency: two requests that both read
+        an unused row would both pass here. The repository takes a row lock for
+        that reason - see MfaRecoveryCodeRepository.get_unused_by_hash."""
+        if self.is_used:
+            raise InvalidRecoveryCodeError()
+        self.used_at = at
