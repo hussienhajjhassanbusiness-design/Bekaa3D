@@ -208,16 +208,87 @@ Written through the existing `AuditLogRepository`, `entity_type =
 | `mfa.enabled` | `/setup/confirm` | `recovery_codes_issued` |
 | `mfa.verified` | TOTP accepted at `/verify` | — |
 | `mfa.recovery_code_used` | recovery code accepted at `/verify` | `remaining_recovery_codes` |
+| `mfa.replay_rejected` | a *correct* TOTP was submitted whose step was already spent | `time_step` |
 | `mfa.recovery_codes_regenerated` | regeneration | `unused_codes_invalidated`, `recovery_codes_issued` |
+
+One more is written against `entity_type = "User"`:
+
+| Action | When | Recorded |
+|---|---|---|
+| `user.mfa_challenge_issued` | a correct admin password reached the challenge at `/auth/login` | — |
+
+That row exists because BR-132 requires auth events to be audited and a correct
+administrator password is one. Without it a half-login is invisible: someone
+holding a stolen admin password could confirm it works, repeatedly, and the log
+would show nothing unless they also cleared the second factor. It is
+deliberately *not* `user.logged_in` — no session was created, and recording one
+that never existed would make "when did this account sign in?" answer wrongly.
 
 A completed challenge also writes the ordinary VS-003 `user.logged_in` row
 against the new session. A session reached through MFA is still a login, and
 splitting the audit vocabulary would make "when did this account sign in?" a
 two-query question.
 
+`mfa.replay_rejected` is the one row written on a *failed* request. A wrong
+code is noise and is not recorded; a correct code arriving twice means one was
+captured somewhere, and an operator needs to be able to see that. Because
+`get_session` runs one transaction per request, the route commits this row
+before answering — otherwise the evidence would roll back with the rest of the
+failed request. `time_step` names the 30-second bucket and is not redeemable
+for anything.
+
 Counts only. No secret, code, hash, password or token is ever written to an
-audit row, and `test_recovery_use_is_audited_without_recording_the_code` holds
-that line.
+audit row, and `test_recovery_use_is_audited_without_recording_the_code` and
+`test_a_detected_replay_is_audited_without_recording_the_code` hold that line.
+
+## One code, one use
+
+An accepted TOTP cannot be presented again. RFC 6238 §5.2 requires it: the
+window reaches one step either side of now, so a code stays live for roughly 90
+seconds, and without this rule an attacker who intercepted a single code — a
+phishing proxy, a glance at a screen — could spend it a second time. That is
+precisely the interception a second factor is supposed to survive.
+
+`mfa_credentials.last_totp_step` holds the RFC 6238 time-step of the last TOTP
+the credential accepted, and any code matching that step **or earlier** is
+refused. It is a high-water mark, not a list of spent codes: nothing
+accumulates and nothing needs collecting. `<=` rather than `==` because the
+window looks one step backwards as well, and the mark never moves backwards, so
+two interleaved requests cannot make a spent step redeemable again.
+
+**Only an accepted TOTP spends a TOTP step.** The scope is deliberately narrow:
+
+- **Recovery codes are independent.** Redeeming one leaves `last_totp_step`
+  untouched, so a TOTP submitted in the same 30-second bucket still works. A
+  recovery code and a TOTP are separate one-time credentials, and spending one
+  must not consume the other. Recovery codes are single-use in their own right
+  — `mfa_recovery_codes.used_at` plus the `SELECT … FOR UPDATE` row lock — and
+  that mechanism is untouched by any of this.
+- **A recovery redemption still updates `last_used_at`.** That column means
+  "last authenticated by any means" and is unchanged in meaning; it is simply
+  no longer what replay protection reads.
+- **Enrollment confirmation does spend its step.** `/setup/confirm` accepts a
+  real code, so that code cannot then log in. No administrator meets this in
+  practice — confirmation already leaves the session MFA-complete, so there is
+  nothing to log in *for*. Tests that enrol and immediately sign in use the
+  `login_totp` helper, which returns the next step's code.
+
+The check is serialised in the database, not in Python. Deciding whether a step
+is spent and then writing the new mark is a read-modify-write, and `max()` in
+the entity only orders values already inside one process's memory: two
+transactions reading the same stale mark would both conclude the step was
+unspent, both accept, and one intercepted code would open two admin sessions.
+`MfaCredentialRepository.get_by_user_id_for_update` takes a `SELECT ... FOR
+UPDATE` row lock, so the second transaction blocks, re-reads the advanced row,
+and correctly refuses. `/auth/mfa/verify` and `/auth/mfa/setup/confirm` both
+take it; the login gate deliberately does not, since it only asks a question
+and locking there would serialise every administrator login. Proven in
+`tests/concurrency/test_totp_step_single_use.py`.
+
+A rejected replay is reported as plain `MFA_INVALID`, byte for byte what a
+simply-wrong code returns. Saying "already used" would confirm to an attacker
+that they hold a genuine code. Internally it is not silent: see
+`mfa.replay_rejected` in the audit table above.
 
 ## Configuration
 
@@ -254,6 +325,43 @@ hand.
 
 - **Admin routes.** VS-005 mounts none — `/api/v1/admin` is the boundary only.
   VS-007 (settings) and VS-009 (user management) add the endpoints.
+
+Deliberately deferred from the VS-005 review, in rough priority order. None is
+a blocker; each is real and should be picked up when the surrounding code is
+next touched.
+
+- **No per-account MFA throttle.** Every limit in the table above is keyed on
+  client IP, and the VS-003 login throttle is per `(email, IP)` — so an
+  attacker who already holds the password and can rotate source addresses faces
+  no account-level counter at all, only the ~1-in-333,000 odds of the code
+  itself. The single-use challenge is what carries the defence today, since
+  each guess costs a full password login. A failure counter on
+  `mfa_credentials` that locks the second factor after N consecutive misses
+  would close it.
+- **Proxy IP handling.** `core/rate_limit.py` keys on `request.client.host`
+  directly. Behind a reverse proxy every caller collapses onto the proxy's
+  address and each limit becomes global rather than per-client. Pre-existing
+  from VS-002, but it now guards the admin boundary, which raises the stakes.
+  Fixing it means deciding which forwarding header is trusted and where.
+- **`MFA_SECRET_KEY` cannot be rotated.** Stored ciphertext carries no key
+  identifier, so a new key orphans every secret and forces every administrator
+  to re-enrol. A `key_version` column on `mfa_credentials` and a dual-read
+  decrypt would make rotation possible, and it is far cheaper to add now than
+  once real administrators exist.
+- **`MfaSessionStore.clear_completed` is unused.** Logout never clears the
+  completion flag. Not exploitable — session ids are UUIDs and are never
+  reused, a revoked session cannot refresh, and the flag grants nothing on its
+  own — but an unused method that reads like a safeguard is worse than no
+  method. Either call it from logout or delete it.
+- **Recovery-code normalisation drops unknown characters.** `normalize_code`
+  strips anything outside the alphabet rather than mapping Crockford
+  confusables, so an administrator who types `O` for `0` or `I` for `1` gets a
+  silently shortened code and a rejection they cannot explain. Mapping the
+  confusables would be friendlier and no less safe.
+- **Entropy comment is off.** `domain/recovery_codes.py` describes a
+  "32-symbol alphabet"; it is 30 symbols, so a 12-character code carries 58.9
+  bits rather than 60. The conclusion stands — the codes are long enough — but
+  the arithmetic in the docstring should say what the code actually does.
 
 Everything else this slice deferred is now closed: the Alembic migration
 (`c42f47ccac47`) creates both tables, the temporary `mfa_tables` test fixture is

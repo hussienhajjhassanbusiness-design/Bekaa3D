@@ -32,6 +32,11 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("secret_ciphertext", sa.LargeBinary(), nullable=False),
+        # RFC 6238 5.2 replay protection: the time-step of the last accepted
+        # TOTP. NULL until the credential accepts its first code. Edited into
+        # this revision rather than added as a follow-up because VS-005 is
+        # still unmerged, so no database anywhere has run it yet.
+        sa.Column("last_totp_step", sa.BigInteger(), nullable=True),
         sa.Column("enabled_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_used_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(

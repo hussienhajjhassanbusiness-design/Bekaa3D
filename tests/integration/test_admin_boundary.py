@@ -5,7 +5,6 @@ VS-007 and VS-009. To test the prefix itself rather than only the routes that
 happen to use `require_admin` today, these tests mount a probe route on a router
 configured exactly as `app.api.v1.admin` is."""
 
-import pyotp
 import pytest
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
@@ -22,6 +21,7 @@ from tests.integration.identity.test_mfa_enrollment import (
     enrol_admin,
     login,
     login_challenged,
+    login_totp,
     make_admin,
     unique_email,
 )
@@ -137,7 +137,7 @@ async def test_an_admin_who_completed_the_login_challenge_is_allowed_through(
 
         verified = client.post(
             "/api/v1/auth/mfa/verify",
-            json={"challenge_id": challenge_id, "code": pyotp.TOTP(secret).now()},
+            json={"challenge_id": challenge_id, "code": login_totp(secret)},
         )
         allowed = client.get(PROBE_PATH)
 

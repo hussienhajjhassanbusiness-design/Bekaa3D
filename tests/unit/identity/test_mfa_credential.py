@@ -14,6 +14,7 @@ def _credential(enabled_at: datetime | None = None) -> MfaCredential:
         secret_ciphertext=b"ciphertext",
         enabled_at=enabled_at,
         last_used_at=None,
+        last_totp_step=None,
         created_at=now,
         updated_at=now,
     )

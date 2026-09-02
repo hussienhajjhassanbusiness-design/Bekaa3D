@@ -1,4 +1,5 @@
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pyotp
 import pytest
@@ -13,6 +14,7 @@ from app.identity.infrastructure.models import (
     UserModel,
 )
 from app.identity.infrastructure.secret_cipher import decrypt_secret
+from app.identity.infrastructure.totp import TOTP_STEP_SECONDS
 from tests.integration.identity.test_login import PASSWORD, register_and_verify
 
 SETUP_PATH = "/api/v1/auth/mfa/setup"
@@ -73,6 +75,22 @@ def start_enrollment(client: TestClient) -> dict[str, str]:
     assert response.status_code == 200, response.text
     body: dict[str, str] = response.json()
     return body
+
+
+def login_totp(secret: str) -> str:
+    """A code for the step *after* the current one, for logging in after
+    enrollment.
+
+    `/setup/confirm` accepts a real TOTP, so that code's time-step is spent -
+    RFC 6238 5.2 forbids accepting the same OTP twice, and the replay guard
+    enforces it. These tests enrol and then immediately log in inside the same
+    30-second bucket, so they need the next step's code.
+
+    No administrator hits this in practice: `/setup/confirm` already leaves the
+    session MFA-complete, so nobody logs in again a second after enrolling. The
+    +1 step is inside the drift window the verifier accepts, so no test has to
+    sleep for it."""
+    return pyotp.TOTP(secret).at(datetime.now(UTC) + timedelta(seconds=TOTP_STEP_SECONDS))
 
 
 def enrol_admin(client: TestClient) -> tuple[str, list[str]]:

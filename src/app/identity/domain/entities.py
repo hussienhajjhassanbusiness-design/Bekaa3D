@@ -150,6 +150,11 @@ class MfaCredential:
     secret_ciphertext: bytes
     enabled_at: datetime | None
     last_used_at: datetime | None
+    # The RFC 6238 time-step of the last TOTP this credential accepted, or None
+    # if it has never accepted one. Deliberately separate from `last_used_at`:
+    # that column means "last authenticated by any means", and a recovery-code
+    # redemption must not consume a TOTP step it has nothing to do with.
+    last_totp_step: int | None
     created_at: datetime
     updated_at: datetime
 
@@ -172,6 +177,35 @@ class MfaCredential:
     def mark_used(self, at: datetime) -> None:
         self.last_used_at = at
         self.updated_at = at
+
+    def is_totp_step_replayed(self, step: int) -> bool:
+        """Whether this credential has already accepted a TOTP at `step`.
+
+        RFC 6238 5.2: a verifier must not accept the same OTP twice. The
+        validity window is roughly 90 seconds wide, so without this an attacker
+        who captures one live code - a phishing proxy, a glance at a screen -
+        can replay it, which is precisely the interception MFA is supposed to
+        make useless.
+
+        A high-water mark rather than a list of spent codes: `<=` rather than
+        `==`, because the window looks one step backwards as well, and a code
+        from the previous step is just as replayable if only equality were
+        checked."""
+        if self.last_totp_step is None:
+            return False
+        return step <= self.last_totp_step
+
+    def record_totp_step(self, step: int, at: datetime) -> None:
+        """Spend a TOTP step, and count it as a use of the credential.
+
+        Only ever called with a step this credential has just accepted a code
+        for. `max` guards the ordering: two requests can interleave, and the
+        mark must never move backwards or an already-spent step would become
+        redeemable again."""
+        self.last_totp_step = (
+            step if self.last_totp_step is None else max(self.last_totp_step, step)
+        )
+        self.mark_used(at)
 
 
 @dataclass
