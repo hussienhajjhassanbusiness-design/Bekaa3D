@@ -36,6 +36,23 @@ async def test_validation_error_maps_to_422_problem_shape() -> None:
 
 
 @pytest.mark.asyncio
+async def test_json_decode_error_maps_to_400_malformed_request() -> None:
+    """The negative control for the test above: pydantic reports an unparseable
+    body through the same RequestValidationError, but api-endpoints.md 5.1 gives
+    it a different status and code. The two must not collapse into one."""
+    exc = RequestValidationError(
+        errors=[{"loc": ("body", 1), "msg": "JSON decode error", "type": "json_invalid"}]
+    )
+
+    response = await validation_exception_handler(_make_request(), exc)
+
+    assert response.status_code == 400
+    body = json.loads(bytes(response.body))
+    assert body["code"] == "MALFORMED_REQUEST"
+    assert body["status"] == 400
+
+
+@pytest.mark.asyncio
 async def test_unhandled_exception_maps_to_500_without_leaking_internals() -> None:
     exc = RuntimeError("db password is hunter2")
 

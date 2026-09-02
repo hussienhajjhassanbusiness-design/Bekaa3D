@@ -31,10 +31,16 @@ class RegisterUser:
         request_id: str | None,
         ip_hash: str | None,
     ) -> None:
+        # Hashed before the branch on purpose, not inside the new-account arm.
+        # Argon2id costs ~80ms and the other arms cost ~10ms, so hashing only
+        # when the address is new made response time a reliable answer to
+        # "is this address registered?" - which api-endpoints.md 195 forbids
+        # as explicitly as it forbids leaking through body or status.
+        password_hash = hash_password(password)
         existing = await self._users.get_by_email(email)
 
         if existing is None:
-            user = await self._users.add(email=email, password_hash=hash_password(password))
+            user = await self._users.add(email=email, password_hash=password_hash)
             await issue_verification_email(
                 user=user, token_repo=self._tokens, outbox_repo=self._outbox
             )

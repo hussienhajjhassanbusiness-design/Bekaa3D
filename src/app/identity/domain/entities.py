@@ -6,8 +6,10 @@ from uuid import UUID
 from app.identity.domain.enums import UserRole
 from app.identity.domain.exceptions import (
     AlreadyVerifiedError,
+    InvalidPasswordResetTokenError,
     InvalidSessionError,
     InvalidVerificationTokenError,
+    PasswordResetTokenExpiredError,
     RefreshTokenReuseError,
     SessionExpiredError,
     SessionRevokedError,
@@ -44,6 +46,19 @@ class User:
         if self.is_verified:
             raise AlreadyVerifiedError(self.id)
         self.email_verified_at = at
+        self.updated_at = at
+
+    def change_password(self, *, new_password_hash: str, at: datetime) -> None:
+        """Replace the stored hash.
+
+        Deliberately takes a hash, not a plaintext password: hashing is an
+        infrastructure concern (Argon2id), and a domain entity that accepted a
+        plaintext password would have to import the hasher and stop being pure.
+
+        Changing the password does not by itself end the user's sessions -
+        SEC-08 requires that, but revocation spans the whole `sessions` table
+        and so belongs to the use case that owns both repositories."""
+        self.password_hash = new_password_hash
         self.updated_at = at
 
 
@@ -133,3 +148,34 @@ class Session:
         """Stolen-token response: record the detection and kill the session."""
         self.reuse_detected_at = at
         self.revoke(at)
+
+
+@dataclass
+class PasswordResetToken:
+    """A single-use, short-lived permission to replace one account's password.
+
+    Structurally the same as VerificationToken but deliberately a separate type:
+    the two prove different things (control of the mailbox vs. authority to
+    change a credential), and one shared class would make it possible to redeem
+    a verification token on the reset endpoint."""
+
+    id: UUID
+    user_id: UUID
+    token_hash: str
+    expires_at: datetime
+    used_at: datetime | None
+    created_at: datetime
+
+    @property
+    def is_used(self) -> bool:
+        return self.used_at is not None
+
+    def mark_used(self, at: datetime) -> None:
+        # Used is checked before expiry so a replayed token always reads as
+        # "invalid" (400) rather than eventually turning into "expired" (410)
+        # once its window passes - the status code must not depend on timing.
+        if self.is_used:
+            raise InvalidPasswordResetTokenError()
+        if at >= self.expires_at:
+            raise PasswordResetTokenExpiredError(self.id)
+        self.used_at = at

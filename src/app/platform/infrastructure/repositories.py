@@ -72,6 +72,8 @@ class EmailOutboxRepository:
         if model is None:
             raise ValueError(f"EmailOutboxMessage {message.id} not found")
         model.status = message.status
+        # payload is written back because reaching a terminal state redacts it
+        model.payload = message.payload
         model.send_after = message.send_after
         model.attempt_count = message.attempt_count
         model.last_error = message.last_error

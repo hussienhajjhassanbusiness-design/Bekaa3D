@@ -12,6 +12,7 @@ In development, following the vertical-slice plan in [`docs/requirments/vertical
 - **VS-001** — bootable API, migration baseline, health/readiness, request correlation
 - **VS-002** — user registration, email verification, resend, transactional outbox, first worker job
 - **VS-003** — login, logout, rotating refresh sessions, CSRF, refresh-token reuse detection
+- **VS-004** — password reset with global session revocation
 
 Each slice adds one complete, tested, end-to-end capability. Build order follows the phased plan in the SRS — see [Build Phases](docs/SRS.md#28-build-phases).
 
@@ -149,6 +150,26 @@ The `token` field in that log entry is the raw value to POST to `/api/v1/auth/ve
 A consequence worth knowing: two clients sharing one session (for example two browser tabs refreshing at the same instant) will trip this. The row lock guarantees exactly one rotation succeeds, and the loser is indistinguishable from a replay, so it revokes the session. That is the intended strict-rotation trade-off, not a bug.
 
 Repeated login failures are throttled per `(email, IP)`. Thresholds count **attempts**, not failures already recorded: attempts 1–3 are free, attempts 4–7 wait 1s/2s/4s/8s, 8 and 9 stay at the 8s cap, and the 10th attempt is refused outright for 15 minutes (`429 RATE_LIMITED` with `Retry-After: 900`). Counters live in Redis and reset on a successful login.
+
+### Password reset (VS-004)
+
+`POST /api/v1/auth/password-reset/request` always answers `202` with the same body, whether the address is unknown, known and eligible, or known but still inside its cooldown. Nothing about the account leaks through the status, the body, or a missing email — the enumeration rule from registration applies here too (`docs/requirments/api-endpoints.md` §5).
+
+Eligible accounts get an outbox message (`password_reset_email`) carrying a 32-byte random token. Only its SHA-256 hash reaches `password_reset_tokens`, so a database leak yields nothing redeemable. The window is **1 hour**, deliberately shorter than the 24h a verification token gets: this token authorises taking over an account. A **2-minute cooldown** per account stops one visitor flooding a mailbox.
+
+`POST /api/v1/auth/password-reset/confirm` takes `{token, new_password}` and returns `204`. In one transaction it:
+
+1. reads the token `FOR UPDATE` and marks it used — single-use has to survive two requests arriving at once, not just in sequence;
+2. replaces the Argon2id password hash;
+3. burns every **other** unused reset token the account holds, so an older link the user requested earlier stops working;
+4. **revokes every session** the user has (SEC-08);
+5. writes a `user.password_reset` audit row recording how many sessions died.
+
+Step 4 is the point of the whole slice. The usual reason to reset a password is that somebody else may have it, and an attacker who is already logged in keeps a working refresh token for 30 days unless the reset kills it. Changing the credential without ending the sessions would report success while leaving the intruder inside.
+
+Failures follow the same shape as email verification: `410 RESOURCE_EXPIRED` for a token past its window, `400 INVALID_TOKEN` for one that is unknown, already used, or belongs to a deactivated account. The used check runs before the expiry check, so a replayed token always answers `400` — a status code that changed once the window closed would tell an attacker when the token was issued.
+
+Reset tokens and verification tokens live in separate tables and cannot be redeemed at each other's endpoints. They prove different things: control of a mailbox, versus authority to replace a credential.
 
 ## Conventions
 
