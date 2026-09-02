@@ -5,12 +5,16 @@ than decoding cookies themselves - one place decides what "authenticated"
 means, and one place decides the error contract for failing it."""
 
 from fastapi import Depends, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.cookies import ACCESS_COOKIE
+from app.api.dependencies import get_session
 from app.core.exceptions import ApiError
 from app.core.security import verify_csrf_token
+from app.identity.domain.entities import User
 from app.identity.domain.enums import UserRole
 from app.identity.domain.exceptions import InvalidSessionError
+from app.identity.infrastructure.repositories import UserRepository
 from app.identity.infrastructure.session_tokens import AccessTokenClaims, decode_access_token
 
 CSRF_HEADER = "X-CSRF-Token"
@@ -39,6 +43,26 @@ async def current_claims(request: Request) -> AccessTokenClaims:
         return decode_access_token(raw)
     except InvalidSessionError as exc:
         raise unauthenticated_error() from exc
+
+
+async def current_user(
+    claims: AccessTokenClaims = Depends(current_claims),
+    session: AsyncSession = Depends(get_session),
+) -> User:
+    """Load the authenticated user's own row, or 401.
+
+    Use this only where the row is needed anyway. `current_claims` deliberately
+    avoids the database (ADR-006), so routes that need nothing beyond the token
+    should keep depending on it directly rather than paying for this read.
+
+    Because the read happens regardless here, it also re-checks
+    `can_authenticate` rather than trusting the token for its full 15 minutes:
+    an account disabled, anonymised or deleted a moment ago must not keep being
+    served its own personal data until the next refresh."""
+    user = await UserRepository(session).get_by_id(claims.user_id)
+    if user is None or not user.can_authenticate:
+        raise unauthenticated_error()
+    return user
 
 
 async def require_csrf(

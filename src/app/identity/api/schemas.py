@@ -3,6 +3,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 
+from app.identity.domain.entities import User
 from app.identity.domain.enums import UserRole
 
 
@@ -144,3 +145,32 @@ class MfaChallengeRead(BaseModel):
 
     challenge_id: str
     expires_in_seconds: int
+
+
+class UserProfileRead(BaseModel):
+    """The authenticated user's own account profile (F-024).
+
+    V1 design assumption: api-endpoints.md 9.1 fixes the response *name* and
+    describes its content as "ID, email, verification/account state" without
+    listing fields. Deliberately narrow - `updated_at` means nothing to a
+    customer, and `anonymized_at`/`deleted_at`/`is_active` would always read
+    the same way here because such an account cannot authenticate at all.
+    Nothing derived from `password_hash` appears, at any remove."""
+
+    id: UUID
+    email: EmailStr
+    role: UserRole
+    email_verified: bool
+    email_verified_at: datetime | None
+    created_at: datetime
+
+    @classmethod
+    def from_user(cls, user: User) -> "UserProfileRead":
+        return cls(
+            id=user.id,
+            email=user.email,
+            role=user.role,
+            email_verified=user.is_verified,
+            email_verified_at=user.email_verified_at,
+            created_at=user.created_at,
+        )
