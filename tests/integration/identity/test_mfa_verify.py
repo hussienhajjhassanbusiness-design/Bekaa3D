@@ -6,7 +6,6 @@ This endpoint is what turns a cleared second factor into the real thing, so
 every test here is ultimately asking the same question: can anything short of a
 correct second factor produce a usable admin session?"""
 
-import pyotp
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -22,6 +21,7 @@ from tests.integration.identity.test_mfa_enrollment import (
     enrol_admin,
     login,
     login_challenged,
+    login_totp,
     make_admin,
     unique_email,
 )
@@ -45,7 +45,7 @@ async def test_a_valid_totp_completes_the_login(db_session: AsyncSession) -> Non
         challenge_id = login_challenged(client, email)
         verified = client.post(
             VERIFY_PATH,
-            json={"challenge_id": challenge_id, "code": pyotp.TOTP(secret).now()},
+            json={"challenge_id": challenge_id, "code": login_totp(secret)},
         )
         # The admin boundary is the real proof that a usable session exists.
         allowed = client.post(
@@ -111,7 +111,7 @@ async def test_verification_sets_the_full_cookie_set_with_the_mfa_claim(
         challenge_id = login_challenged(client, email)
         response = client.post(
             VERIFY_PATH,
-            json={"challenge_id": challenge_id, "code": pyotp.TOTP(secret).now()},
+            json={"challenge_id": challenge_id, "code": login_totp(secret)},
         )
 
         assert response.status_code == 204
@@ -160,7 +160,7 @@ async def test_an_unknown_challenge_is_gone(db_session: AsyncSession) -> None:
 
         response = client.post(
             VERIFY_PATH,
-            json={"challenge_id": "never-issued", "code": pyotp.TOTP(secret).now()},
+            json={"challenge_id": "never-issued", "code": login_totp(secret)},
         )
 
     assert response.status_code == 410
@@ -184,7 +184,7 @@ async def test_a_challenge_cannot_be_replayed(db_session: AsyncSession) -> None:
         first = client.post(VERIFY_PATH, json={"challenge_id": challenge_id, "code": "000000"})
         replayed = client.post(
             VERIFY_PATH,
-            json={"challenge_id": challenge_id, "code": pyotp.TOTP(secret).now()},
+            json={"challenge_id": challenge_id, "code": login_totp(secret)},
         )
 
     assert first.status_code == 401
@@ -204,7 +204,7 @@ async def test_a_successful_challenge_is_also_spent(db_session: AsyncSession) ->
         secret, _ = enrol_admin(client)
 
         challenge_id = login_challenged(client, email)
-        code = pyotp.TOTP(secret).now()
+        code = login_totp(secret)
         first = client.post(VERIFY_PATH, json={"challenge_id": challenge_id, "code": code})
         client.cookies.clear()
         second = client.post(VERIFY_PATH, json={"challenge_id": challenge_id, "code": code})
@@ -235,7 +235,7 @@ async def test_a_challenge_only_ever_logs_in_the_account_it_was_issued_for(
         challenge_id = login_challenged(client, first_email)
         response = client.post(
             VERIFY_PATH,
-            json={"challenge_id": challenge_id, "code": pyotp.TOTP(first_secret).now()},
+            json={"challenge_id": challenge_id, "code": login_totp(first_secret)},
         )
         assert response.status_code == 204
         access = client.cookies.get(ACCESS_COOKIE)
@@ -487,7 +487,7 @@ async def test_the_mfa_claim_survives_a_refresh(db_session: AsyncSession) -> Non
         assert (
             client.post(
                 VERIFY_PATH,
-                json={"challenge_id": challenge_id, "code": pyotp.TOTP(secret).now()},
+                json={"challenge_id": challenge_id, "code": login_totp(secret)},
             ).status_code
             == 204
         )

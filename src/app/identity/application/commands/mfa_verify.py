@@ -5,6 +5,7 @@ from uuid import UUID
 from app.identity.domain.exceptions import (
     InvalidMfaCodeError,
     InvalidRecoveryCodeError,
+    MfaCodeReplayedError,
     MfaNotEnrolledError,
 )
 from app.identity.domain.recovery_codes import normalize_code
@@ -14,7 +15,7 @@ from app.identity.infrastructure.repositories import (
 )
 from app.identity.infrastructure.secret_cipher import decrypt_secret
 from app.identity.infrastructure.token_service import hash_token
-from app.identity.infrastructure.totp import verify_code
+from app.identity.infrastructure.totp import verify_code_step
 from app.platform.infrastructure.repositories import AuditLogRepository
 
 
@@ -51,7 +52,11 @@ class VerifyMfa:
         request_id: str | None,
         ip_hash: str | None,
     ) -> MfaVerifyResult:
-        credential = await self._credentials.get_by_user_id(user_id)
+        # Locked, not merely read: this method decides whether a TOTP step is
+        # spent and then writes the new mark, and two concurrent verifications
+        # of the same code must not both pass that check. See
+        # MfaCredentialRepository.get_by_user_id_for_update.
+        credential = await self._credentials.get_by_user_id_for_update(user_id)
         if credential is None or not credential.is_enabled:
             raise MfaNotEnrolledError()
 
@@ -82,11 +87,44 @@ class VerifyMfa:
                 request_id=request_id,
                 ip_hash=ip_hash,
             )
+            # Counts as a use of the credential, but deliberately does not
+            # touch `last_totp_step`: a recovery code and a TOTP are separate
+            # one-time credentials, and spending one must not consume a step
+            # of the other. Recovery codes are already single-use in their own
+            # right, enforced by `used_at` plus the row lock.
+            credential.mark_used(now)
         else:
-            if code is None or not verify_code(
-                secret=decrypt_secret(credential.secret_ciphertext), code=code
-            ):
+            matched_step = (
+                None
+                if code is None
+                else verify_code_step(
+                    secret=decrypt_secret(credential.secret_ciphertext), code=code, now=now
+                )
+            )
+            if matched_step is None:
                 raise InvalidMfaCodeError()
+
+            if credential.is_totp_step_replayed(matched_step):
+                # Recorded, then refused. A correct code arriving a second time
+                # is not a typo - it means one was captured - so this is the
+                # branch an operator needs to be able to see. Neither the code
+                # nor the secret is written: the step number identifies *which*
+                # 30-second bucket without being redeemable, and knowing that
+                # a replay happened is the whole point.
+                await self._audit.add(
+                    actor_user_id=user_id,
+                    action="mfa.replay_rejected",
+                    entity_type="MfaCredential",
+                    entity_id=credential.id,
+                    after_data={"time_step": matched_step},
+                    request_id=request_id,
+                    ip_hash=ip_hash,
+                )
+                # Distinct type so the route can persist that row before
+                # answering; the answer itself is the ordinary MFA_INVALID.
+                raise MfaCodeReplayedError()
+
+            credential.record_totp_step(matched_step, now)
             remaining = await self._recovery.count_unused(credential.id)
             await self._audit.add(
                 actor_user_id=user_id,
@@ -97,7 +135,6 @@ class VerifyMfa:
                 ip_hash=ip_hash,
             )
 
-        credential.mark_used(now)
         await self._credentials.save(credential)
 
         return MfaVerifyResult(

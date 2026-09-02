@@ -53,6 +53,7 @@ from app.identity.domain.exceptions import (
     InvalidMfaCodeError,
     InvalidRecoveryCodeError,
     MfaAlreadyEnabledError,
+    MfaCodeReplayedError,
     MfaNotEnrolledError,
 )
 from app.identity.infrastructure.repositories import (
@@ -175,6 +176,7 @@ async def setup_mfa(
     responses={
         401: {"description": "No valid session."},
         404: {"description": "Caller is not an administrator."},
+        409: {"description": "MFA is already enabled; confirmation cannot be repeated."},
         422: {"description": "The code did not match the enrolled secret."},
         429: {"description": "Rate limit exceeded."},
     },
@@ -213,6 +215,16 @@ async def confirm_mfa_setup(
             code="MFA_INVALID",
             title="Second factor rejected",
             detail="The code provided does not match the enrolled secret.",
+        ) from exc
+    except MfaAlreadyEnabledError as exc:
+        # Same answer `/setup` gives for the same reason. Confirmation is part
+        # of enrollment and enrollment is over; repeating it would rotate the
+        # recovery-code set without the password that route requires.
+        raise ApiError(
+            status_code=status.HTTP_409_CONFLICT,
+            code="INVALID_STATE_TRANSITION",
+            title="MFA is already enabled",
+            detail="MFA is already enabled for this account and cannot be re-confirmed.",
         ) from exc
     except MfaNotEnrolledError as exc:
         raise not_found_error() from exc
@@ -303,6 +315,16 @@ async def verify_mfa(
             request_id=request_id,
             ip_hash=ip_hash,
         )
+    except MfaCodeReplayedError as exc:
+        # Caught before InvalidMfaCodeError, which it subclasses. The request
+        # must fail, but the `mfa.replay_rejected` row it just wrote has to
+        # survive: get_session wraps the request in one transaction, so raising
+        # straight through would roll the evidence back along with everything
+        # else. Same pattern the refresh route uses for reuse detection.
+        await session.commit()
+        # Identical to any other rejected code. The audit row is internal; the
+        # caller learns nothing about why.
+        raise _invalid_mfa_error() from exc
     except (InvalidMfaCodeError, InvalidRecoveryCodeError) as exc:
         raise _invalid_mfa_error() from exc
     except MfaNotEnrolledError as exc:

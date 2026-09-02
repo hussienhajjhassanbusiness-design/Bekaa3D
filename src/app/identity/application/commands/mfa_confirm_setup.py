@@ -2,7 +2,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
-from app.identity.domain.exceptions import InvalidMfaCodeError, MfaNotEnrolledError
+from app.identity.domain.exceptions import (
+    InvalidMfaCodeError,
+    MfaAlreadyEnabledError,
+    MfaNotEnrolledError,
+)
 from app.identity.domain.recovery_codes import generate_code_set, normalize_code
 from app.identity.infrastructure.repositories import (
     MfaCredentialRepository,
@@ -10,7 +14,7 @@ from app.identity.infrastructure.repositories import (
 )
 from app.identity.infrastructure.secret_cipher import decrypt_secret
 from app.identity.infrastructure.token_service import hash_token
-from app.identity.infrastructure.totp import verify_code
+from app.identity.infrastructure.totp import verify_code_step
 from app.platform.infrastructure.repositories import AuditLogRepository
 
 
@@ -45,16 +49,37 @@ class ConfirmMfaSetup:
         request_id: str | None,
         ip_hash: str | None,
     ) -> MfaConfirmSetupResult:
-        credential = await self._credentials.get_by_user_id(user_id)
+        # Locked for the same reason as the verify path: this writes both
+        # `enabled_at` and `last_totp_step` after reading them.
+        credential = await self._credentials.get_by_user_id_for_update(user_id)
         if credential is None:
             raise MfaNotEnrolledError()
 
-        if not verify_code(secret=decrypt_secret(credential.secret_ciphertext), code=code):
-            raise InvalidMfaCodeError()
+        # Confirmation is a one-time step in enrollment, not a repeatable
+        # operation. Without this guard a caller holding an admin session and a
+        # single valid TOTP could re-confirm an already-enabled credential,
+        # which wipes the unused recovery-code set and issues a fresh one -
+        # i.e. a second route to regeneration that skips the password
+        # `/auth/mfa/recovery-codes/regenerate` deliberately demands. Two doors
+        # to one action, and the weaker lock is the one that counts.
+        #
+        # Re-enrolling a *new* secret is likewise refused here and in
+        # `MfaSetup`; it is a disable-then-enrol flow, which V1 does not define.
+        if credential.is_enabled:
+            raise MfaAlreadyEnabledError()
 
         now = datetime.now(UTC)
+        matched_step = verify_code_step(
+            secret=decrypt_secret(credential.secret_ciphertext), code=code, now=now
+        )
+        if matched_step is None:
+            raise InvalidMfaCodeError()
+
         credential.enable(now)
-        credential.mark_used(now)
+        # Confirmation accepts a real TOTP, so its step is spent like any
+        # other. Without this the very code that proved the authenticator
+        # works would still be redeemable at `/auth/mfa/verify`.
+        credential.record_totp_step(matched_step, now)
         await self._credentials.save(credential)
 
         # A first set replaces anything left over from an earlier abandoned

@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -145,6 +146,12 @@ class MfaCredentialModel(Base):
     # BYTEA, never TEXT: this is ciphertext, not an encoded string, and typing
     # it as bytes keeps it from being concatenated into a log line by accident.
     secret_ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # RFC 6238 time-step of the last accepted TOTP, so the same one-time code
+    # cannot be presented twice inside its ~90-second window (RFC 6238 5.2).
+    # NULL until the first TOTP is accepted. BigInteger rather than Integer:
+    # the value is a running step count and there is no reason to plan a
+    # migration around its eventual width.
+    last_totp_step: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(

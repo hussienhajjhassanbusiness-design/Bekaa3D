@@ -143,3 +143,18 @@ class InvalidMfaCodeError(IdentityDomainError):
     One exception for all three: which of them it was is exactly what an
     attacker probing the endpoint would like to learn. Surfaces as the stable
     `MFA_INVALID` code."""
+
+
+class MfaCodeReplayedError(InvalidMfaCodeError):
+    """A genuine TOTP was submitted whose time-step has already been spent.
+
+    Subclasses `InvalidMfaCodeError` so that any handler which does not know
+    about replay still refuses the code - failing closed is the only safe
+    default here.
+
+    It exists as a distinct type for exactly one reason: this is the branch
+    worth recording. A wrong code is noise, but a *correct* code arriving twice
+    means one was captured somewhere, and the operator should be able to see
+    that. The caller must still answer with the ordinary `MFA_INVALID`;
+    admitting "already used" would confirm to an attacker that they hold a real
+    code."""

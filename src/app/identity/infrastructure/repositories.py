@@ -78,6 +78,7 @@ def _mfa_credential_to_domain(model: MfaCredentialModel) -> MfaCredential:
         secret_ciphertext=bytes(model.secret_ciphertext),
         enabled_at=model.enabled_at,
         last_used_at=model.last_used_at,
+        last_totp_step=model.last_totp_step,
         created_at=model.created_at,
         updated_at=model.updated_at,
     )
@@ -228,7 +229,42 @@ class MfaCredentialRepository:
         self._session = session
 
     async def get_by_user_id(self, user_id: UUID) -> MfaCredential | None:
+        """Plain read, no lock. For callers that only ask a question - the
+        login gate asking whether a challenge is needed, for instance. Locking
+        there would serialise every administrator login for no benefit."""
         stmt = select(MfaCredentialModel).where(MfaCredentialModel.user_id == user_id)
+        model = await self._session.scalar(stmt)
+        return _mfa_credential_to_domain(model) if model else None
+
+    async def get_by_user_id_for_update(self, user_id: UUID) -> MfaCredential | None:
+        """Read the credential and hold a row lock until the transaction ends.
+
+        Required by anything that decides *and then writes* `last_totp_step`.
+        The replay check is a read-modify-write - read the mark, compare the
+        matched step against it, write the new mark - and `max()` in the entity
+        only orders values already in one process's memory. Two transactions
+        that both read the same stale mark would both conclude the step was
+        unspent, both accept, and one intercepted code would open two admin
+        sessions. That is the exact failure the second factor exists to
+        prevent, so the serialisation has to be in the database.
+
+        With the lock the second transaction blocks here, then re-reads the row
+        the first has already advanced and correctly finds the step spent.
+
+        `populate_existing` matters: without it SQLAlchemy would hand back the
+        instance already in this session's identity map and the post-lock
+        re-read would silently return pre-lock data. Requests get a fresh
+        session so the map is normally empty, but a guarantee that depends on
+        that staying true is not a guarantee.
+
+        Same idiom as `SessionRepository.get_for_update` and
+        `MfaRecoveryCodeRepository.get_unused_by_hash`."""
+        stmt = (
+            select(MfaCredentialModel)
+            .where(MfaCredentialModel.user_id == user_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         model = await self._session.scalar(stmt)
         return _mfa_credential_to_domain(model) if model else None
 
@@ -250,6 +286,7 @@ class MfaCredentialRepository:
         model.secret_ciphertext = credential.secret_ciphertext
         model.enabled_at = credential.enabled_at
         model.last_used_at = credential.last_used_at
+        model.last_totp_step = credential.last_totp_step
         await self._session.flush()
 
 

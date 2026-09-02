@@ -92,6 +92,22 @@ class Login:
         # exactly as they would for any other correct password. Everything
         # above this point is VS-003's original login, unchanged.
         if await self._mfa_gate.challenge_required(user):
+            # BR-132 requires auth events to be audited, and this is one: the
+            # password for an administrator account was correct. Without a row
+            # here the half-login is invisible - someone holding a stolen admin
+            # password could confirm it works, repeatedly, and the audit log
+            # would show nothing at all unless they also cleared the second
+            # factor. `user.logged_in` is deliberately not reused: no session
+            # exists yet, and recording one that was never created would make
+            # "when did this account sign in?" answer wrongly.
+            await self._audit.add(
+                actor_user_id=user.id,
+                action="user.mfa_challenge_issued",
+                entity_type="User",
+                entity_id=user.id,
+                request_id=request_id,
+                ip_hash=ip_hash,
+            )
             return MfaChallengeRequired(user_id=user.id)
         # ---- end VS-005 MFA integration -------------------------------------
 
