@@ -38,7 +38,12 @@ class RefreshSession:
         self._audit = audit_repo
 
     async def execute(
-        self, *, raw_refresh_token: str, request_id: str | None, ip_hash: str | None
+        self,
+        *,
+        raw_refresh_token: str,
+        request_id: str | None,
+        ip_hash: str | None,
+        mfa_completed: bool = False,
     ) -> RefreshResult:
         claims = decode_refresh_token(raw_refresh_token)
 
@@ -105,6 +110,10 @@ class RefreshSession:
                 role=user.role,
                 email_verified=user.is_verified,
                 now=now,
+                # Carried across rotation, or an administrator would drop back
+                # to MFA-incomplete every time the access token is renewed.
+                # Defaults False so a caller that does not track it fails closed.
+                mfa_completed=mfa_completed,
             ),
             refresh_token=refresh_token,
             csrf_token=csrf_token_for_session(session.id),

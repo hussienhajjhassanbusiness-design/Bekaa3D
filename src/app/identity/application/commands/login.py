@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 from app.core.config import get_settings
 from app.core.security import csrf_token_for_session
+from app.identity.application.services.admin_mfa_gate import AdminMfaGate, MfaChallengeRequired
 from app.identity.application.services.login_throttle import LoginThrottle
 from app.identity.domain.enums import UserRole
 from app.identity.domain.exceptions import AccountDisabledError, InvalidCredentialsError
@@ -40,11 +41,14 @@ class Login:
         session_repo: SessionRepository,
         audit_repo: AuditLogRepository,
         throttle: LoginThrottle,
+        # VS-005 MFA integration.
+        mfa_gate: AdminMfaGate,
     ) -> None:
         self._users = user_repo
         self._sessions = session_repo
         self._audit = audit_repo
         self._throttle = throttle
+        self._mfa_gate = mfa_gate
 
     async def execute(
         self,
@@ -55,7 +59,7 @@ class Login:
         ip_hash: str | None,
         user_agent: str | None,
         request_id: str | None,
-    ) -> LoginResult:
+    ) -> LoginResult | MfaChallengeRequired:
         await self._throttle.check(email=email, ip=ip)
 
         user = await self._users.get_by_email(email)
@@ -76,6 +80,36 @@ class Login:
             raise AccountDisabledError(user.id)
 
         await self._throttle.reset(email=email, ip=ip)
+
+        # ---- VS-005 MFA integration (SEC-04, api-endpoints.md:252) ----------
+        # The password has proven the caller owns this account, but for an
+        # administrator with MFA enabled that is only half of a login. Return
+        # before anything is minted: no session row, no tokens, no cookies, so
+        # a stolen password on its own buys nothing but a five-minute challenge.
+        #
+        # Placed after the throttle reset on purpose - the password *was*
+        # correct, so the failure counters for this (email, IP) should clear
+        # exactly as they would for any other correct password. Everything
+        # above this point is VS-003's original login, unchanged.
+        if await self._mfa_gate.challenge_required(user):
+            # BR-132 requires auth events to be audited, and this is one: the
+            # password for an administrator account was correct. Without a row
+            # here the half-login is invisible - someone holding a stolen admin
+            # password could confirm it works, repeatedly, and the audit log
+            # would show nothing at all unless they also cleared the second
+            # factor. `user.logged_in` is deliberately not reused: no session
+            # exists yet, and recording one that was never created would make
+            # "when did this account sign in?" answer wrongly.
+            await self._audit.add(
+                actor_user_id=user.id,
+                action="user.mfa_challenge_issued",
+                entity_type="User",
+                entity_id=user.id,
+                request_id=request_id,
+                ip_hash=ip_hash,
+            )
+            return MfaChallengeRequired(user_id=user.id)
+        # ---- end VS-005 MFA integration -------------------------------------
 
         settings = get_settings()
         now = datetime.now(UTC)

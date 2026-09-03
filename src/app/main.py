@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from app.api.errors import register_exception_handlers
 from app.api.health import router as health_router
 from app.api.middleware import RequestIDMiddleware
+from app.api.openapi import custom_openapi
 from app.api.v1.router import router as v1_router
 from app.core import models as _models  # noqa: F401 - registers models onto Base.metadata
 from app.core.config import get_settings
@@ -33,3 +34,7 @@ app.add_middleware(RequestIDMiddleware)
 register_exception_handlers(app)
 app.include_router(health_router)
 app.include_router(v1_router)
+
+# VS-005: describe the cookie/CSRF/MFA security schemes in the generated
+# OpenAPI document. Documentation only - no route's behaviour changes.
+app.openapi = lambda: custom_openapi(app)  # type: ignore[method-assign]

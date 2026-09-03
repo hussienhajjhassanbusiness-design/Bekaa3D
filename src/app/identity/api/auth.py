@@ -14,6 +14,7 @@ from app.identity.api.dependencies import (
 )
 from app.identity.api.schemas import (
     LoginRequest,
+    MfaChallengeRead,
     RegisterRequest,
     RegistrationAccepted,
     ResendVerificationRequest,
@@ -26,7 +27,9 @@ from app.identity.application.commands.refresh_session import RefreshSession
 from app.identity.application.commands.register_user import RegisterUser
 from app.identity.application.commands.resend_verification import ResendVerification
 from app.identity.application.commands.verify_email import VerifyEmail
+from app.identity.application.services.admin_mfa_gate import AdminMfaGate, MfaChallengeRequired
 from app.identity.application.services.login_throttle import LoginThrottle
+from app.identity.application.services.mfa_session import CHALLENGE_TTL_SECONDS, MfaSessionStore
 from app.identity.domain.exceptions import (
     AccountDisabledError,
     AccountLockedError,
@@ -38,6 +41,7 @@ from app.identity.domain.exceptions import (
     VerificationTokenExpiredError,
 )
 from app.identity.infrastructure.repositories import (
+    MfaCredentialRepository,
     SessionRepository,
     UserRepository,
     VerificationTokenRepository,
@@ -127,8 +131,18 @@ async def verify_email(
 
 @router.post(
     "/login",
-    response_model=SessionRead,
+    # response_model is None because this route has two documented success
+    # shapes: 200 SessionRead, or - VS-005 MFA integration - 202
+    # MfaChallengeRead. The return annotation carries both.
+    response_model=None,
     dependencies=[Depends(_LOGIN_LIMIT)],
+    responses={
+        200: {"model": SessionRead, "description": "Session established."},
+        202: {
+            "model": MfaChallengeRead,
+            "description": "Administrator must clear a second factor. No cookies are set.",
+        },
+    },
 )
 async def login(
     body: LoginRequest,
@@ -136,12 +150,14 @@ async def login(
     response: Response,
     agent: str | None = Depends(user_agent),
     session: AsyncSession = Depends(get_session),
-) -> SessionRead:
+) -> SessionRead | MfaChallengeRead:
     use_case = Login(
         user_repo=UserRepository(session),
         session_repo=SessionRepository(session),
         audit_repo=AuditLogRepository(session),
         throttle=LoginThrottle(request.app.state.redis),
+        # VS-005 MFA integration.
+        mfa_gate=AdminMfaGate(MfaCredentialRepository(session)),
     )
     ip = client_ip(request)
     try:
@@ -175,6 +191,20 @@ async def login(
             title="Account unavailable",
             detail="This account can no longer be used to sign in.",
         ) from exc
+
+    # ---- VS-005 MFA integration (api-endpoints.md:252) ----------------------
+    # An administrator with MFA enabled gets a challenge instead of a session.
+    # Nothing is set on the response: no access cookie, no refresh cookie, no
+    # CSRF cookie. The challenge id is the only thing that leaves here, and on
+    # its own it authenticates nothing - `/auth/mfa/verify` still demands a
+    # valid second factor before any session exists.
+    if isinstance(result, MfaChallengeRequired):
+        challenge_id = await MfaSessionStore(request.app.state.redis).create_login_challenge(
+            result.user_id
+        )
+        response.status_code = status.HTTP_202_ACCEPTED
+        return MfaChallengeRead(challenge_id=challenge_id, expires_in_seconds=CHALLENGE_TTL_SECONDS)
+    # ---- end VS-005 MFA integration -----------------------------------------
 
     set_session_cookies(
         response,
@@ -247,11 +277,16 @@ async def refresh(
         audit_repo=AuditLogRepository(session),
     )
     ip = client_ip(request)
+    # An administrator who cleared MFA keeps that standing across rotation;
+    # without this the new access token would drop the claim and bounce them
+    # back to the boundary every 15 minutes.
+    mfa_completed = await MfaSessionStore(request.app.state.redis).is_completed(claims.session_id)
     try:
         result = await use_case.execute(
             raw_refresh_token=raw_refresh_token,
             request_id=getattr(request.state, "request_id", None),
             ip_hash=hash_ip(ip) if ip else None,
+            mfa_completed=mfa_completed,
         )
     except SessionTerminatedError as exc:
         # The request must fail, but its writes must survive. get_session wraps

@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -9,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     Text,
     func,
     text,
@@ -17,7 +19,7 @@ from sqlalchemy.dialects.postgresql import CITEXT, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
-from app.identity.domain.enums import UserRole
+from app.identity.domain.enums import MfaMethod, UserRole
 
 
 class UserModel(Base):
@@ -113,3 +115,83 @@ class VerificationTokenModel(Base):
     )
 
     __table_args__ = (Index("ix_verification_tokens_user_id", "user_id"),)
+
+
+class MfaCredentialModel(Base):
+    """Second-factor credential, at most one per account (database-design.md 5.6).
+
+    The UNIQUE on `user_id` is the constraint that enforces "one MFA credential
+    per account" - an application check alone would lose the race between two
+    concurrent enrollments and leave an account with two secrets, either of
+    which would then open the admin boundary."""
+
+    __tablename__ = "mfa_credentials"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        # CASCADE is correct only for a legitimate physical purge; ordinary
+        # account closure is anonymisation and never reaches this (5.6 "FK Delete").
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    method: Mapped[MfaMethod] = mapped_column(
+        Enum(MfaMethod, name="mfa_method", values_callable=lambda enum: [e.value for e in enum]),
+        nullable=False,
+        server_default=MfaMethod.TOTP.value,
+    )
+    # BYTEA, never TEXT: this is ciphertext, not an encoded string, and typing
+    # it as bytes keeps it from being concatenated into a log line by accident.
+    secret_ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # RFC 6238 time-step of the last accepted TOTP, so the same one-time code
+    # cannot be presented twice inside its ~90-second window (RFC 6238 5.2).
+    # NULL until the first TOTP is accepted. BigInteger rather than Integer:
+    # the value is a running step count and there is no reason to plan a
+    # migration around its eventual width.
+    last_totp_step: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class MfaRecoveryCodeModel(Base):
+    """One-time recovery codes for an enabled credential (database-design.md 5.7).
+
+    Codes are stored only as deterministic hashes. See
+    identity/domain/recovery_codes.py for why the frozen `code_hash TEXT UNIQUE`
+    rules out a salted KDF here."""
+
+    __tablename__ = "mfa_recovery_codes"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    mfa_credential_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("mfa_credentials.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    code_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        # Exactly the partial index database-design.md 5.7 specifies. Every hot
+        # query - redeem a code, count what is left, wipe the set on regeneration
+        # - filters on unused rows, and spent codes are dead weight in the index.
+        Index(
+            "ix_mfa_recovery_codes_unused",
+            "mfa_credential_id",
+            postgresql_where=text("used_at IS NULL"),
+        ),
+    )

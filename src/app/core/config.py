@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     access_token_minutes: int = 15
     refresh_token_days: int = 30
     ip_hash_salt: str
+    # Encrypts the stored TOTP secret (database-design.md 5.6 requires
+    # `secret_ciphertext`). Distinct from jwt_signing_key and csrf_secret on
+    # purpose: one key, one job, so rotating or leaking one does not widen
+    # into the others.
+    mfa_secret_key: str
+    # Shown by the authenticator app beside the account name.
+    mfa_issuer: str = "Bekaa3D"
 
     storage_root: str = "/data"
     stl_private_dir: str = "/data/stl_private"

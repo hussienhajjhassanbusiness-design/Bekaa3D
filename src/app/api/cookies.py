@@ -30,11 +30,15 @@ def _secure() -> bool:
     return get_settings().environment != "development"
 
 
-def set_session_cookies(
-    response: Response, *, access_token: str, refresh_token: str, csrf_token: str
-) -> None:
-    settings = get_settings()
+def set_access_cookie(response: Response, access_token: str) -> None:
+    """Replace only the access cookie, leaving the session's refresh and CSRF
+    cookies alone.
 
+    Used by the MFA step-up, which re-mints the access token so it carries the
+    `mfa_completed` claim. Rotating the refresh token there would be wrong -
+    the session is not being renewed, only re-described - and rotating CSRF
+    would break any request the client already has in flight."""
+    settings = get_settings()
     response.set_cookie(
         ACCESS_COOKIE,
         access_token,
@@ -44,6 +48,14 @@ def set_session_cookies(
         samesite=_SAME_SITE,
         path="/",
     )
+
+
+def set_session_cookies(
+    response: Response, *, access_token: str, refresh_token: str, csrf_token: str
+) -> None:
+    settings = get_settings()
+
+    set_access_cookie(response, access_token)
     response.set_cookie(
         REFRESH_COOKIE,
         refresh_token,
