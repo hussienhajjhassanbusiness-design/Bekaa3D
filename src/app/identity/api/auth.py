@@ -314,12 +314,19 @@ async def refresh(
 )
 async def resend_verification(
     body: ResendVerificationRequest,
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> RegistrationAccepted:
     use_case = ResendVerification(
         user_repo=UserRepository(session),
         token_repo=VerificationTokenRepository(session),
         outbox_repo=EmailOutboxRepository(session),
+        audit_repo=AuditLogRepository(session),
     )
-    await use_case.execute(email=body.email)
+    ip = client_ip(request)
+    await use_case.execute(
+        email=body.email,
+        request_id=getattr(request.state, "request_id", None),
+        ip_hash=hash_ip(ip) if ip else None,
+    )
     return RegistrationAccepted()

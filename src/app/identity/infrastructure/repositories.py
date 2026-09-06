@@ -124,6 +124,31 @@ class UserRepository:
         model.deleted_at = user.deleted_at
         await self._session.flush()
 
+    async def purge_never_verified_before(self, cutoff: datetime) -> int:
+        """Physically delete accounts that were never verified and are older
+        than `cutoff`. Returns how many went.
+
+        FR-02 requires this ("Never-verified accounts are purged after the
+        configured period") and database-design.md 5.1 explicitly permits a
+        physical purge for this one case, in contrast to the anonymise-rather-
+        than-delete rule that governs verified customers. The filter is
+        `email_verified_at IS NULL`, so a verified account can never be caught
+        by it regardless of age.
+
+        Child rows go with the user through the schema's own foreign keys:
+        verification_tokens and sessions are ON DELETE CASCADE, while
+        email_outbox and audit_logs are ON DELETE SET NULL so the delivery and
+        audit history survives the account it referred to.
+        """
+        stmt = (
+            delete(UserModel)
+            .where(UserModel.email_verified_at.is_(None), UserModel.created_at < cutoff)
+            .returning(UserModel.id)
+        )
+        purged_ids = (await self._session.scalars(stmt)).all()
+        await self._session.flush()
+        return len(purged_ids)
+
 
 class SessionRepository:
     def __init__(self, session: AsyncSession) -> None:

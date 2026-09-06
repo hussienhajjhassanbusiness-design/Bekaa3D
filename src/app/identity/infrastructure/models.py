@@ -114,7 +114,18 @@ class VerificationTokenModel(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
-    __table_args__ = (Index("ix_verification_tokens_user_id", "user_id"),)
+    __table_args__ = (
+        Index("ix_verification_tokens_user_id", "user_id"),
+        # database-design.md 19.11 lists verification_tokens(expires_at) for the
+        # retention purge; the VS-002 migration omitted it. Partial on
+        # used_at IS NULL: redeemed rows are found by the same scan and do not
+        # need indexing by date.
+        Index(
+            "ix_verification_tokens_expires_at_live",
+            "expires_at",
+            postgresql_where=text("used_at IS NULL"),
+        ),
+    )
 
 
 class MfaCredentialModel(Base):

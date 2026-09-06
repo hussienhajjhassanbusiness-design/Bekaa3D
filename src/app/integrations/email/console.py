@@ -13,4 +13,14 @@ class ConsoleEmailProvider(EmailProviderPort):
     chosen - see SRS §30.2 (Awaiting Client)."""
 
     async def send(self, *, to: str, template: str, payload: dict[str, Any]) -> None:
-        await logger.ainfo("console_email_send", to=to, template=template, payload=payload)
+        # Deliberately logs the payload's *keys* and never its values: the
+        # payload carries the raw verification token and a token-bearing URL, and
+        # a structured log is copied, shipped and retained far more widely than
+        # the database is (SEC-26). Recipient and template are safe metadata and
+        # are what makes the line useful.
+        await logger.ainfo(
+            "console_email_send",
+            to=to,
+            template=template,
+            payload_keys=sorted(payload),
+        )
