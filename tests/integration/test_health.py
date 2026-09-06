@@ -33,3 +33,33 @@ def test_readiness_reports_ok_when_db_and_redis_are_reachable() -> None:
         assert "commit" in body
 
         get_settings.cache_clear()
+
+
+@pytest.mark.integration
+def test_readiness_fails_when_redis_is_unavailable() -> None:
+    """Readiness probes Redis as well as Postgres, and the suite only ever
+    covered the database leg. With a healthy database behind it, a dead Redis
+    must still take the instance out of rotation - otherwise a load balancer
+    keeps sending traffic to a process that cannot rate-limit, throttle logins
+    or enqueue a job.
+
+    The `detail` assertion is what proves the request reached the Redis check
+    rather than failing earlier for some unrelated reason.
+    """
+    with PostgresContainer("postgres:16", driver="asyncpg") as postgres:
+        os.environ["DATABASE_URL"] = postgres.get_connection_url()
+        os.environ["REDIS_URL"] = "redis://127.0.0.1:1/0"
+        get_settings.cache_clear()
+
+        from app.main import app
+
+        with TestClient(app) as client:
+            response = client.get("/health/ready")
+
+        assert response.status_code == 503
+        body = response.json()
+        assert body["code"] == "SERVICE_UNAVAILABLE"
+        assert body["detail"] == "Redis is unavailable."
+
+        os.environ.pop("REDIS_URL", None)
+        get_settings.cache_clear()
