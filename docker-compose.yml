@@ -80,12 +80,21 @@ services:
     env_file: .env
     environment:
       - PYTHONPATH=/app/src
-    command: ["arq", "app.worker.WorkerSettings", "--watch", "src"]
-    # The image's Dockerfile HEALTHCHECK curls /health/live, which only the api
-    # service serves - the worker process has no HTTP server, so that check
-    # would always fail here. Disabled until a real arq-based check is added.
+    # Deliberately NOT `arq ... --watch`: arq's watch mode never awaits the
+    # worker task, so a Redis blip kills the poll loop while the process stays
+    # alive and every email in the system silently stops. `python -m app.worker`
+    # exits non-zero instead, and `restart: unless-stopped` brings it back.
+    # Trade-off: worker code changes need `docker compose restart worker`.
+    command: ["python", "-m", "app.worker"]
     healthcheck:
-      disable: true
+      # arq's own check: reads the heartbeat the worker writes to Redis each
+      # poll and fails if it has gone stale, so a stalled-but-running worker
+      # shows as unhealthy instead of looking fine.
+      test: ["CMD", "arq", "app.worker.WorkerSettings", "--check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     volumes:
       - ./src:/app/src
     depends_on:

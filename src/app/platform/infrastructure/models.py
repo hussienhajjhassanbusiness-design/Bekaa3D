@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, Integer, Text, func, text
+from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, Integer, Text, func, text
 from sqlalchemy.dialects.postgresql import CITEXT, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -48,6 +48,11 @@ class EmailOutboxModel(Base):
             "send_after",
             postgresql_where=text("status = 'pending'"),
         ),
+        # database-design.md 13.3 specifies CHECK >= 0. attempt_count only ever
+        # moves through mark_failed, but the count drives the retry backoff
+        # exponent - a negative value would compute a nonsensical delay, and
+        # that belongs in the database rather than in application trust.
+        CheckConstraint("attempt_count >= 0", name="ck_email_outbox_attempt_count_non_negative"),
     )
 
 

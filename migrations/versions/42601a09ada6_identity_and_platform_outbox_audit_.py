@@ -163,3 +163,16 @@ def downgrade() -> None:
     )
     op.drop_table("users")
     # ### end Alembic commands ###
+
+    # Autogenerate does not emit these. `sa.Enum(...)` inside create_table issues
+    # an implicit CREATE TYPE, but drop_table issues only DROP TABLE - SQLAlchemy
+    # cannot know whether another table still uses the type. The result was a
+    # downgrade that left `user_role` and `outbox_status` behind, so the next
+    # upgrade died on DuplicateObjectError before creating a single table.
+    #
+    # They are dropped here, in the migration that creates them, and only after
+    # every dependent table is gone. A later migration that reuses either type
+    # must NOT drop it in its own downgrade: the type is shared, and dropping it
+    # there would break `users` while `users` still exists.
+    for enum_name in ("outbox_status", "user_role"):
+        sa.Enum(name=enum_name).drop(op.get_bind(), checkfirst=True)
