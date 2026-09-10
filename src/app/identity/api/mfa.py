@@ -243,6 +243,11 @@ async def confirm_mfa_setup(
             email_verified=claims.email_verified,
             now=datetime.now(UTC),
             mfa_completed=True,
+            # Re-minting after regenerating recovery codes. `claims.auth_epoch`
+            # was already checked against the account's current value by
+            # `require_admin` on the way in, so carrying it forward keeps this
+            # token exactly as valid as the one it replaces - and no more.
+            auth_epoch=claims.auth_epoch,
         ),
     )
     return MfaRecoveryCodesRead(
@@ -286,9 +291,19 @@ async def verify_mfa(
     an attacker a five-minute window to sit and guess against."""
     store = MfaSessionStore(request.app.state.redis)
 
-    pending_user_id = await store.resolve_login_challenge(body.challenge_id)
+    pending = await store.resolve_login_challenge(body.challenge_id)
     await store.consume_login_challenge(body.challenge_id)
-    if pending_user_id is None:
+    # A challenge minted before the account's last password reset is dead
+    # (SEC-08). Checked here, before the second factor is examined, purely so a
+    # doomed challenge does not spend the administrator's current TOTP time-step
+    # on the way to being refused - the replay guard would then reject their
+    # legitimate retry for the rest of that step. This is not the authoritative
+    # check: CompleteMfaLogin repeats it under the user row lock, which is what
+    # actually closes the race against a reset committing mid-request.
+    stale_epoch = pending is not None and pending.epoch != await UserRepository(
+        session
+    ).get_auth_epoch(pending.user_id)
+    if pending is None or stale_epoch:
         raise ApiError(
             status_code=status.HTTP_410_GONE,
             code="RESOURCE_EXPIRED",
@@ -309,7 +324,7 @@ async def verify_mfa(
         await verify.execute(
             # From the challenge, never from the request body: the caller does
             # not get to name the account they are completing login for.
-            user_id=pending_user_id,
+            user_id=pending.user_id,
             code=body.code,
             recovery_code=body.recovery_code,
             request_id=request_id,
@@ -340,7 +355,11 @@ async def verify_mfa(
     )
     try:
         result = await complete.execute(
-            user_id=pending_user_id,
+            user_id=pending.user_id,
+            # Carried from the challenge and re-checked under the user row lock:
+            # a challenge minted before a password reset must not mint a session
+            # after it (SEC-08).
+            challenge_epoch=pending.epoch,
             ip_hash=ip_hash,
             user_agent=agent,
             request_id=request_id,

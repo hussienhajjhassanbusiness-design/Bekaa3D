@@ -158,3 +158,18 @@ class MfaCodeReplayedError(InvalidMfaCodeError):
     that. The caller must still answer with the ordinary `MFA_INVALID`;
     admitting "already used" would confirm to an attacker that they hold a real
     code."""
+
+
+class InvalidPasswordResetTokenError(IdentityDomainError):
+    """Reset token does not exist, does not match, or has already been used.
+
+    One exception for all three, for the same reason as
+    InvalidVerificationTokenError: the difference must never reach the caller,
+    or the endpoint becomes an oracle for "this address has a live reset in
+    flight"."""
+
+
+class PasswordResetTokenExpiredError(IdentityDomainError):
+    def __init__(self, token_id: UUID) -> None:
+        super().__init__(f"Password reset token {token_id} has expired.")
+        self.token_id = token_id

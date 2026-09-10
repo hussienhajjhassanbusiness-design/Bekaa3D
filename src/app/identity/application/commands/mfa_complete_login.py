@@ -63,14 +63,31 @@ class CompleteMfaLogin:
         self,
         *,
         user_id: UUID,
+        challenge_epoch: int,
         ip_hash: str | None,
         user_agent: str | None,
         request_id: str | None,
     ) -> CompleteMfaLoginResult:
         """`user_id` comes from the resolved challenge, never from the request
         body - the caller never gets to name the account they are completing
-        login for."""
-        user = await self._users.get_by_id(user_id)
+        login for.
+
+        The read takes a row lock, and that lock is what makes this safe against
+        a password reset arriving at the same moment (SEC-08). Both operations
+        hold it, so they cannot interleave, and only two orderings exist:
+
+        - **Reset first.** It bumps the account's challenge epoch and commits
+          before this transaction gets the lock, so the epoch check below fails
+          and no session is ever created.
+        - **This first.** The session is inserted and committed before the reset
+          gets the lock, so the reset's `revoke_all_for_user` sees the row and
+          revokes it.
+
+        Without the lock there is a third ordering - this transaction inserting
+        its session after the reset's revocation UPDATE has already run - which
+        would leave a live session created from a pre-reset challenge.
+        """
+        user = await self._users.get_by_id_for_update(user_id)
         if user is None:
             # The account vanished between the password check and the second
             # factor. Nothing here is a useful signal to an attacker, and the
@@ -83,6 +100,13 @@ class CompleteMfaLogin:
         # skipping it here would make the MFA path the weaker of the two.
         if not user.can_authenticate:
             raise AccountDisabledError(user.id)
+
+        # Straight off the row this transaction holds locked, so a reset that
+        # committed before this point is always visible and one that has not
+        # committed cannot be. A challenge minted before the account's last
+        # password reset carries a stale epoch and buys nothing.
+        if challenge_epoch != user.auth_epoch:
+            raise InvalidCredentialsError()
 
         settings = get_settings()
         now = datetime.now(UTC)
@@ -130,6 +154,9 @@ class CompleteMfaLogin:
                 # Born MFA-complete. There is no window in which this session
                 # exists without the claim.
                 mfa_completed=True,
+                # From the locked row, so this token cannot be stamped with an
+                # epoch a concurrent reset has already moved past.
+                auth_epoch=user.auth_epoch,
             ),
             refresh_token=refresh_token,
             csrf_token=csrf_token_for_session(session_id),

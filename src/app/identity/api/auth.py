@@ -15,16 +15,21 @@ from app.identity.api.dependencies import (
 from app.identity.api.schemas import (
     LoginRequest,
     MfaChallengeRead,
+    PasswordResetAccepted,
+    PasswordResetConfirm,
+    PasswordResetRequest,
     RegisterRequest,
     RegistrationAccepted,
     ResendVerificationRequest,
     SessionRead,
     VerifyEmailRequest,
 )
+from app.identity.application.commands.confirm_password_reset import ConfirmPasswordReset
 from app.identity.application.commands.login import Login
 from app.identity.application.commands.logout import Logout
 from app.identity.application.commands.refresh_session import RefreshSession
 from app.identity.application.commands.register_user import RegisterUser
+from app.identity.application.commands.request_password_reset import RequestPasswordReset
 from app.identity.application.commands.resend_verification import ResendVerification
 from app.identity.application.commands.verify_email import VerifyEmail
 from app.identity.application.services.admin_mfa_gate import AdminMfaGate, MfaChallengeRequired
@@ -35,13 +40,16 @@ from app.identity.domain.exceptions import (
     AccountLockedError,
     AlreadyVerifiedError,
     InvalidCredentialsError,
+    InvalidPasswordResetTokenError,
     InvalidSessionError,
     InvalidVerificationTokenError,
+    PasswordResetTokenExpiredError,
     SessionTerminatedError,
     VerificationTokenExpiredError,
 )
 from app.identity.infrastructure.repositories import (
     MfaCredentialRepository,
+    PasswordResetTokenRepository,
     SessionRepository,
     UserRepository,
     VerificationTokenRepository,
@@ -64,6 +72,11 @@ _VERIFY_LIMIT = rate_limiter(key_prefix="auth:verify", limit=20, window_seconds=
 # roughly every 15 minutes, and one IP may carry several of them.
 _LOGIN_LIMIT = rate_limiter(key_prefix="auth:login", limit=20, window_seconds=3600)
 _REFRESH_LIMIT = rate_limiter(key_prefix="auth:refresh", limit=60, window_seconds=3600)
+# Reset request matches resend-verification: both send mail to an address the
+# caller has not proved they own. Confirm matches verify-email: its token is 32
+# random bytes, so the limit is about retry storms, not guessing.
+_RESET_REQUEST_LIMIT = rate_limiter(key_prefix="auth:reset-request", limit=5, window_seconds=3600)
+_RESET_CONFIRM_LIMIT = rate_limiter(key_prefix="auth:reset-confirm", limit=20, window_seconds=3600)
 
 
 @router.post(
@@ -200,7 +213,11 @@ async def login(
     # valid second factor before any session exists.
     if isinstance(result, MfaChallengeRequired):
         challenge_id = await MfaSessionStore(request.app.state.redis).create_login_challenge(
-            result.user_id
+            result.user_id,
+            # Read under login's row lock and carried out on the result, not
+            # re-read here: a reset landing in between would otherwise mint a
+            # challenge stamped with a value that looks current (ADR-018).
+            result.auth_epoch,
         )
         response.status_code = status.HTTP_202_ACCEPTED
         return MfaChallengeRead(challenge_id=challenge_id, expires_in_seconds=CHALLENGE_TTL_SECONDS)
@@ -330,3 +347,94 @@ async def resend_verification(
         ip_hash=hash_ip(ip) if ip else None,
     )
     return RegistrationAccepted()
+
+
+@router.post(
+    "/password-reset/request",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=PasswordResetAccepted,
+    dependencies=[Depends(_RESET_REQUEST_LIMIT)],
+    summary="Request a password reset email",
+    responses={
+        202: {"description": "Always, whether or not the address is known."},
+        429: {"description": "Rate limit exceeded."},
+    },
+)
+async def request_password_reset(
+    body: PasswordResetRequest,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> PasswordResetAccepted:
+    use_case = RequestPasswordReset(
+        user_repo=UserRepository(session),
+        token_repo=PasswordResetTokenRepository(session),
+        outbox_repo=EmailOutboxRepository(session),
+        audit_repo=AuditLogRepository(session),
+    )
+    ip = client_ip(request)
+    await use_case.execute(
+        email=body.email,
+        request_id=getattr(request.state, "request_id", None),
+        ip_hash=hash_ip(ip) if ip else None,
+    )
+    # Unconditional, and there is no error branch above it on purpose: the
+    # 202 must be identical for a known address, an unknown one, and one still
+    # inside its cooldown (api-endpoints.md 5).
+    return PasswordResetAccepted()
+
+
+@router.post(
+    "/password-reset/confirm",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(_RESET_CONFIRM_LIMIT)],
+    summary="Redeem a reset token and replace the password",
+    responses={
+        204: {"description": "Password replaced; every session revoked."},
+        400: {"description": "Token unknown, already used, or account unusable."},
+        410: {"description": "Token past its one-hour window."},
+        429: {"description": "Rate limit exceeded."},
+    },
+)
+async def confirm_password_reset(
+    body: PasswordResetConfirm,
+    request: Request,
+    response: Response,
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    use_case = ConfirmPasswordReset(
+        user_repo=UserRepository(session),
+        token_repo=PasswordResetTokenRepository(session),
+        session_repo=SessionRepository(session),
+        audit_repo=AuditLogRepository(session),
+        # SEC-08 covers every pre-reset authentication artefact, and an
+        # outstanding VS-005 MFA login challenge is one of them - it lives in
+        # Redis, so revoking `sessions` rows alone would not reach it.
+    )
+    ip = client_ip(request)
+    try:
+        await use_case.execute(
+            raw_token=body.token,
+            new_password=body.new_password,
+            request_id=getattr(request.state, "request_id", None),
+            ip_hash=hash_ip(ip) if ip else None,
+        )
+    except PasswordResetTokenExpiredError as exc:
+        raise ApiError(
+            status_code=status.HTTP_410_GONE,
+            code="RESOURCE_EXPIRED",
+            title="Reset link expired",
+            detail="This password reset link has expired. Request a new one.",
+        ) from exc
+    except InvalidPasswordResetTokenError as exc:
+        raise ApiError(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="INVALID_TOKEN",
+            title="Reset link invalid",
+            detail="This password reset link is invalid or has already been used.",
+        ) from exc
+
+    # The use case revoked every session server-side; this clears the now-dead
+    # cookies from whichever browser made the call. Harmless when the caller was
+    # not logged in, and it stops a browser from carrying credentials that will
+    # only fail on the next request.
+    clear_session_cookies(response)

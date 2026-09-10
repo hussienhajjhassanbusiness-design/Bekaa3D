@@ -12,6 +12,7 @@ In development, following the vertical-slice plan in [`docs/requirments/vertical
 - **VS-001** — bootable API, migration baseline, health/readiness, request correlation
 - **VS-002** — user registration, email verification, resend, transactional outbox, first worker job
 - **VS-003** — login, logout, rotating refresh sessions, CSRF, refresh-token reuse detection
+- **VS-004** — password reset, with every pre-reset session and MFA challenge invalidated
 - **VS-005** — administrator MFA (TOTP), login-gated admin sessions, one-time recovery codes, isolated `/api/v1/admin` boundary
 - **VS-006** — current customer profile (`GET /api/v1/me`)
 
@@ -151,6 +152,44 @@ The `token` field in that log entry is the raw value to POST to `/api/v1/auth/ve
 A consequence worth knowing: two clients sharing one session (for example two browser tabs refreshing at the same instant) will trip this. The row lock guarantees exactly one rotation succeeds, and the loser is indistinguishable from a replay, so it revokes the session. That is the intended strict-rotation trade-off, not a bug.
 
 Repeated login failures are throttled per `(email, IP)`. Thresholds count **attempts**, not failures already recorded: attempts 1–3 are free, attempts 4–7 wait 1s/2s/4s/8s, 8 and 9 stay at the 8s cap, and the 10th attempt is refused outright for 15 minutes (`429 RATE_LIMITED` with `Retry-After: 900`). Counters live in Redis and reset on a successful login.
+
+### Password reset (VS-004)
+
+`POST /api/v1/auth/password-reset/request` always answers `202` with the same body, whether the address is unknown, known and eligible, or known but still inside its cooldown. Nothing about the account leaks through the status, the body, or a missing email — the enumeration rule from registration applies here too (`docs/requirments/api-endpoints.md` §5).
+
+Eligible accounts get an outbox message (`password_reset_email`) carrying a 32-byte random token. Only its SHA-256 hash reaches `password_reset_tokens`, so a database leak yields nothing redeemable. The window is **1 hour**, deliberately shorter than the 24h a verification token gets: this token authorises taking over an account. A **2-minute cooldown** per account stops one visitor flooding a mailbox.
+
+`POST /api/v1/auth/password-reset/confirm` takes `{token, new_password}` and returns `204`. In one transaction it:
+
+1. reads the token `FOR UPDATE` and marks it used — single-use has to survive two requests arriving at once, not just in sequence;
+2. takes a row lock on the user (see **Racing an MFA login** below);
+3. advances the account's **authentication epoch**, invalidating every access token, session and outstanding MFA challenge at once;
+4. replaces the Argon2id password hash;
+5. burns every **other** unused reset token the account holds, so an older link the user requested earlier stops working;
+6. **revokes every session** the user has (SEC-08);
+7. writes a `user.password_reset` audit row recording how many sessions died.
+
+Steps 3 and 6 are the point of the whole slice. The usual reason to reset a password is that somebody else may have it, and an attacker who is already logged in keeps a working refresh token for 30 days unless the reset kills it. Changing the credential without ending the sessions would report success while leaving the intruder inside.
+
+**Pre-reset authentication state, and what survives.** Sessions are not the only thing a reset has to end, and the other two live outside the `sessions` table. An access token is signed and self-contained, good for its full 15 minutes. An MFA login challenge — handed out as soon as an administrator's password checks out — lives in Redis. Revoking rows reaches neither, so before ADR-018 a reset left the attacker's access token working and their challenge redeemable.
+
+All three now carry the account's **authentication epoch**, a monotonic counter in `users.auth_epoch`: access tokens as an `auth_epoch` JWT claim, challenges alongside the user id in Redis. A successful reset advances it by one — in the same transaction, on the same locked row, as the password change and the session revocation — and every authentication decision refuses anything stamped with a stale value.
+
+It lives in PostgreSQL rather than Redis on purpose. A cache that answers *successfully* with a lost key — a restarted container, an evicted entry, a restored snapshot — would silently re-validate every token the reset had just revoked, and that failure looks exactly like normal operation. `docker-compose.yml` runs `redis:7-alpine` with no volume under `restart: unless-stopped`, so an empty, healthy keyspace after a restart is the expected case, not an edge one.
+
+`current_claims` validates the JWT signature and standard claims first — a forged or expired token is refused with no database traffic at all — and only then reads one indexed scalar. Tokens minted before this claim existed read as epoch 0, as does every pre-existing row, so current sessions survive the deploy and start failing only once their account's epoch actually moves. This reverses one half of ADR-006 knowingly; see [ADR-018](docs/adr/ADR-018-authentication-epoch.md).
+
+**Lock order is `users` before `sessions`, everywhere** — reset, login, MFA completion and refresh rotation. Refresh was restructured for it: VS-003 locked the session row first, and bolting a user lock on after it closes a deadlock cycle against the reset's order (PostgreSQL reports `DeadlockDetectedError`). Login takes the lock *before* verifying the password, so a reset committing mid-login cannot leave login validating a hash the database no longer holds.
+
+The invalidation runs **before** the database writes are allowed to stand. If Redis is unreachable it raises, the transaction rolls back, and no reset is reported — the endpoint fails closed rather than answering `204` while a pre-reset challenge is still live. The reverse (challenges invalidated for a reset that then fails) costs an administrator one extra sign-in and is the safe direction to err.
+
+What a reset deliberately does **not** touch: MFA enrolment, the TOTP secret, and the recovery codes. A reset proves control of the mailbox, which is exactly the thing the second factor exists to be independent of — clearing it would turn a mailbox compromise into a full account takeover.
+
+**Racing an MFA login.** Both the reset and `POST /auth/mfa/verify` take `SELECT ... FOR UPDATE` on the user row, so they cannot interleave and only two orderings exist. If the reset commits first, the epoch check refuses the challenge and no session is ever created. If the redemption commits first, its session already exists when `revoke_all_for_user` runs, so the reset revokes it. Without that lock a third ordering is possible — the redemption inserting its session *after* the revocation `UPDATE` has run — which would leave a live session minted from a pre-reset challenge. `tests/concurrency/test_password_reset_vs_mfa_challenge.py` holds that hole closed.
+
+Failures follow the same shape as email verification: `410 RESOURCE_EXPIRED` for a token past its window, `400 INVALID_TOKEN` for one that is unknown, already used, or belongs to a deactivated account. The used check runs before the expiry check, so a replayed token always answers `400` — a status code that changed once the window closed would tell an attacker when the token was issued.
+
+Reset tokens and verification tokens live in separate tables and cannot be redeemed at each other's endpoints. They prove different things: control of a mailbox, versus authority to replace a credential.
 
 ## Conventions
 

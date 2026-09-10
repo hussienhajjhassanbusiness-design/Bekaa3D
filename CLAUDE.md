@@ -25,10 +25,11 @@ Vertical slices merged so far (full plan: `docs/requirments/vertical-slice-plan.
 - **VS-001** — bootable API, migration baseline, health/readiness, request correlation
 - **VS-002** — user registration, email verification, resend, transactional outbox, first worker job (identity + platform contexts, email provider port, Redis rate limiting, `dispatch_outbox` arq job)
 - **VS-003** — login, logout, rotating refresh sessions, CSRF, refresh-token reuse detection (`sessions` table, JWT access/refresh cookies, HMAC double-submit CSRF, Redis login throttle, `SELECT ... FOR UPDATE` rotation)
+- **VS-004** — password reset with global revocation of pre-reset authentication state (`password_reset_tokens` table, enumeration-safe request, single-use token read `FOR UPDATE`, every session revoked and every outstanding MFA login challenge invalidated on confirm per SEC-08)
 - **VS-005** — administrator MFA and the admin security boundary (`mfa_credentials`/`mfa_recovery_codes`, encrypted TOTP secrets, login-gated admin sessions per ADR-017, hashed one-time recovery codes, `/api/v1/admin` behind `require_admin`)
 - **VS-006** — current customer profile: read-only `GET /api/v1/me`, `UserProfileRead`, `current_user` dependency (no migration, no write path — V1 defines no mutable profile field)
 
-**Next up: VS-004** — password reset with global session revocation. VS-008 (notifications) is also unblocked and can run in parallel with it.
+**Next up: VS-007** (admin-editable settings) and VS-008 (notifications), both unblocked. VS-008 needs no migration, so it is the safe slice to run in parallel with anything holding the migration lock.
 
 Local dev stack (`docker-compose.yml`: postgres, redis, clamav, api, worker) — see README's Getting Started section for bootstrap commands and the current port-mapping note.
 
@@ -38,6 +39,7 @@ Small, real, and deliberately deferred — not bugs anyone is mid-way through fi
 
 - **Postgres host port** — published on `5442`, not `5432`, because a native Windows PostgreSQL service occupies `5432` on the primary dev machine. Revert `docker-compose.yml` to `"5432:5432"` once that's resolved.
 - **Coarse login rate limiter** (`src/app/core/rate_limit.py`) — returns `429` with `RateLimit-*` headers but no `Retry-After`, so clients get no machine-readable wait time. The per-`(email, IP)` login throttle *does* send one; the two disagree. Introduced in VS-002.
+- **Duplicate user read on `GET /api/v1/me`** — since ADR-018, `current_claims` reads `users.auth_epoch` and `current_user` then reads the same row in full, so that one route issues two primary-key lookups. Harmless at current scale and deliberately not fixed inside VS-004: the obvious collapse (hydrating the whole row in `current_claims`) would make *every* authenticated request pay for a full read, password hash included, to spare one route a scalar one. Revisit if `/me` traffic or the authenticated hot path is ever profiled.
 - **Line endings** — no `.gitattributes`, so Git warns `LF will be replaced by CRLF` on every commit from Windows. Harmless with one developer; with two on different platforms it produces whole-file diffs where nothing changed. `* text=auto eol=lf` fixes it, ideally before the second contributor's first commit.
 
 ### Local secrets

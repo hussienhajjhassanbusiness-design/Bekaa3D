@@ -35,6 +35,13 @@ class AccessTokenClaims:
     # 15-minute life, or a caller that does not set it - fails closed at the
     # admin boundary rather than being waved through.
     mfa_completed: bool = False
+    # The account's authentication epoch at the moment this token was minted.
+    # `current_claims` refuses the token if the account has moved past it, which
+    # is what makes a password reset take effect immediately rather than at the
+    # next refresh (ADR-018). Defaults to 0 so a token minted before the claim
+    # existed still decodes - and still works, right up until that account's
+    # first reset.
+    auth_epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -51,6 +58,7 @@ def issue_access_token(
     email_verified: bool,
     now: datetime,
     mfa_completed: bool = False,
+    auth_epoch: int = 0,
 ) -> str:
     settings = get_settings()
     payload = {
@@ -60,6 +68,10 @@ def issue_access_token(
         "role": role.value,
         "ver": email_verified,
         "mfa": mfa_completed,
+        # Spelled out rather than abbreviated like its neighbours: the short
+        # names above predate it, and a security claim nobody can read at a
+        # glance is one nobody checks.
+        "auth_epoch": auth_epoch,
         "iat": now,
         "exp": now + timedelta(minutes=settings.access_token_minutes),
     }
@@ -102,6 +114,16 @@ def _decode(token: str, *, expected_type: str) -> dict[str, Any]:
 
 def decode_access_token(token: str) -> AccessTokenClaims:
     payload = _decode(token, expected_type=_ACCESS_TYPE)
+    raw_epoch = payload.get("auth_epoch", 0)
+    # Strict, and checked before anything else is read. `bool` is a subclass of
+    # `int` in Python, so `isinstance(True, int)` is True and a `"auth_epoch":
+    # true` claim would otherwise be silently read as epoch 1. A float, a
+    # numeric string or a negative value are all equally malformed. None of them
+    # may fall back to the default of 0, because 0 is the one value that matches
+    # a never-reset account - a malformed claim failing open would be a bypass,
+    # not a compatibility shim.
+    if isinstance(raw_epoch, bool) or not isinstance(raw_epoch, int) or raw_epoch < 0:
+        raise InvalidSessionError()
     try:
         return AccessTokenClaims(
             user_id=UUID(payload["sub"]),
@@ -111,6 +133,7 @@ def decode_access_token(token: str) -> AccessTokenClaims:
             # .get, not [...]: a token minted before this claim existed is still
             # validly signed and must decode, simply without MFA.
             mfa_completed=bool(payload.get("mfa", False)),
+            auth_epoch=raw_epoch,
         )
     except (KeyError, ValueError) as exc:
         raise InvalidSessionError() from exc
