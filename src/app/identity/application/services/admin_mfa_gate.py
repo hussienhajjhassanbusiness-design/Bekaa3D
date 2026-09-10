@@ -24,13 +24,20 @@ from app.identity.infrastructure.repositories import MfaCredentialRepository
 class MfaChallengeRequired:
     """Login stopped short of issuing a session: this account must clear MFA.
 
-    Carries only the user id, and deliberately nothing else. At this point no
-    session row exists, no token has been minted, and no cookie has been set -
-    so there is nothing here that would be safe to hand back to the caller. The
-    route converts it into an opaque, short-lived challenge id, which is what
-    `202 MfaChallengeRead` actually returns (api-endpoints.md:252)."""
+    Carries the user id and the account's authentication epoch, and
+    deliberately nothing else. At this point no session row exists, no token has
+    been minted, and no cookie has been set - so there is nothing here that
+    would be safe to hand back to the caller. The route converts it into an
+    opaque, short-lived challenge id, which is what `202 MfaChallengeRead`
+    actually returns (api-endpoints.md:252).
+
+    The epoch travels with it because the challenge has to be stamped with the
+    value read under login's row lock, not one re-read afterwards - a reset
+    landing in between would otherwise mint a challenge that looks current
+    (ADR-018)."""
 
     user_id: UUID
+    auth_epoch: int
 
 
 class AdminMfaGate:

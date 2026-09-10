@@ -23,6 +23,7 @@ Neither is a source of truth about whether an account has MFA enabled -
 `mfa_credentials.enabled_at` is."""
 
 import secrets
+from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
@@ -31,6 +32,21 @@ from uuid import UUID
 # the window in which a correct password alone is worth something, so it is
 # kept tight.
 CHALLENGE_TTL_SECONDS = 5 * 60
+
+
+@dataclass(frozen=True)
+class PendingLoginChallenge:
+    """A resolved login challenge: whose it is, and which authentication epoch
+    it was minted in.
+
+    The epoch is the account-wide one from `auth_epoch`, not a marker of this
+    module's own: a challenge is an authentication artefact like any other, and
+    a password reset has to invalidate all of them together. It is carried here
+    rather than checked here because the authoritative check has to happen under
+    the user row lock - see CompleteMfaLogin."""
+
+    user_id: UUID
+    epoch: int
 
 
 class MfaSessionStore:
@@ -61,7 +77,7 @@ class MfaSessionStore:
     async def clear_completed(self, session_id: UUID) -> None:
         await self._redis.delete(self._completed_key(session_id))
 
-    async def create_login_challenge(self, user_id: UUID) -> str:
+    async def create_login_challenge(self, user_id: UUID, auth_epoch: int) -> str:
         """Open a pending-login challenge for one account and return its id.
 
         The id is random and opaque rather than anything derived from the
@@ -74,12 +90,19 @@ class MfaSessionStore:
         not the weak link; the TOTP behind it is, which is why
         `/auth/mfa/verify` is rate limited on top of this."""
         challenge_id = secrets.token_urlsafe(24)
+        # The account's authentication epoch is stamped into the challenge at
+        # issuance. A password reset increments that epoch, so every challenge
+        # minted before it is left carrying a stale number and is refused on
+        # redemption (SEC-08, ADR-018). The caller supplies it rather than this
+        # store reading it, so the epoch has exactly one owner.
         await self._redis.set(
-            self._challenge_key(challenge_id), str(user_id), ex=CHALLENGE_TTL_SECONDS
+            self._challenge_key(challenge_id),
+            f"{user_id}:{auth_epoch}",
+            ex=CHALLENGE_TTL_SECONDS,
         )
         return challenge_id
 
-    async def resolve_login_challenge(self, challenge_id: str) -> UUID | None:
+    async def resolve_login_challenge(self, challenge_id: str) -> PendingLoginChallenge | None:
         """The account a pending-login challenge belongs to, or None if the id
         is unknown, already spent, or expired.
 
@@ -90,10 +113,18 @@ class MfaSessionStore:
         if raw is None:
             return None
         value = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+        user_part, _, epoch_part = value.partition(":")
         try:
-            return UUID(value)
+            user_id = UUID(user_part)
         except ValueError:
             return None
+        try:
+            # A value with no epoch segment cannot be trusted to predate any
+            # invalidation, so it is given an epoch that matches nothing.
+            epoch = int(epoch_part) if epoch_part else -1
+        except ValueError:
+            epoch = -1
+        return PendingLoginChallenge(user_id=user_id, epoch=epoch)
 
     async def consume_login_challenge(self, challenge_id: str) -> None:
         """Single-use: a challenge is spent whether or not the factor turns out

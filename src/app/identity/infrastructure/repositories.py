@@ -3,12 +3,13 @@ from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import CursorResult, delete, func, select
+from sqlalchemy import CursorResult, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.identity.domain.entities import (
     MfaCredential,
     MfaRecoveryCode,
+    PasswordResetToken,
     Session,
     User,
     VerificationToken,
@@ -17,6 +18,7 @@ from app.identity.domain.enums import MfaMethod
 from app.identity.infrastructure.models import (
     MfaCredentialModel,
     MfaRecoveryCodeModel,
+    PasswordResetTokenModel,
     SessionModel,
     UserModel,
     VerificationTokenModel,
@@ -39,6 +41,7 @@ def _user_to_domain(model: UserModel) -> User:
         deleted_at=model.deleted_at,
         created_at=model.created_at,
         updated_at=model.updated_at,
+        auth_epoch=model.auth_epoch,
     )
 
 
@@ -94,6 +97,17 @@ def _mfa_recovery_code_to_domain(model: MfaRecoveryCodeModel) -> MfaRecoveryCode
     )
 
 
+def _reset_token_to_domain(model: PasswordResetTokenModel) -> PasswordResetToken:
+    return PasswordResetToken(
+        id=model.id,
+        user_id=model.user_id,
+        token_hash=model.token_hash,
+        expires_at=model.expires_at,
+        used_at=model.used_at,
+        created_at=model.created_at,
+    )
+
+
 class UserRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -107,6 +121,39 @@ class UserRepository:
         model = await self._session.get(UserModel, user_id)
         return _user_to_domain(model) if model else None
 
+    async def get_auth_epoch(self, user_id: UUID) -> int | None:
+        """The account's current authentication epoch, or None if no such user.
+
+        Deliberately one indexed scalar rather than `get_by_id`: this runs on
+        every authenticated request (ADR-018), and hydrating a whole `User` -
+        password hash included - to read one integer would be wasteful and would
+        put the credential in memory on a path that has no use for it."""
+        stmt = select(UserModel.auth_epoch).where(UserModel.id == user_id)
+        epoch: int | None = await self._session.scalar(stmt)
+        return epoch
+
+    async def get_by_id_for_update(self, user_id: UUID) -> User | None:
+        """Read one user and hold a row lock on them until the transaction ends.
+
+        This is the serialisation point between a password reset and the
+        completion of an MFA login challenge that was issued before it. Both
+        take this lock, so the reset's `revoke_all_for_user` and
+        `CompleteMfaLogin`'s session INSERT can never interleave: whichever
+        arrives second sees the other's committed work.
+
+        `populate_existing` for the same reason MfaCredentialRepository needs
+        it - without it SQLAlchemy hands back the instance already in this
+        session's identity map, and the post-lock read would return pre-lock
+        data."""
+        stmt = (
+            select(UserModel)
+            .where(UserModel.id == user_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        model = await self._session.scalar(stmt)
+        return _user_to_domain(model) if model else None
+
     async def add(self, *, email: str, password_hash: str) -> User:
         model = UserModel(email=email, password_hash=password_hash)
         self._session.add(model)
@@ -118,10 +165,15 @@ class UserRepository:
         model = await self._session.get(UserModel, user.id)
         if model is None:
             raise ValueError(f"User {user.id} not found")
+        # password_hash is written back because VS-004 lets a password change
+        # after the row exists. `email` is still absent on purpose - changing an
+        # address is a verification flow of its own, not a silent field update.
+        model.password_hash = user.password_hash
         model.email_verified_at = user.email_verified_at
         model.is_active = user.is_active
         model.anonymized_at = user.anonymized_at
         model.deleted_at = user.deleted_at
+        model.auth_epoch = user.auth_epoch
         await self._session.flush()
 
     async def purge_never_verified_before(self, cutoff: datetime) -> int:
@@ -154,6 +206,18 @@ class SessionRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    async def get_owner_id(self, session_id: UUID) -> UUID | None:
+        """Whose session this is, without taking any lock.
+
+        Exists solely so refresh can obey the `users`-before-`sessions` lock
+        order: it has a session id and needs the user row locked first, and it
+        cannot learn which user that is without looking. Deliberately reads one
+        column and decides nothing - every condition that matters is revalidated
+        afterwards against the locked re-read of the session."""
+        stmt = select(SessionModel.user_id).where(SessionModel.id == session_id)
+        owner_id: UUID | None = await self._session.scalar(stmt)
+        return owner_id
+
     async def get_for_update(self, session_id: UUID) -> Session | None:
         """Read one session row and hold a row lock until the transaction ends.
 
@@ -161,10 +225,27 @@ class SessionRepository:
         if the same refresh token is submitted twice at once, the second
         transaction blocks here until the first commits, then reads the
         *already rotated* row and correctly sees its own token as stale.
+
         Without the lock both would read version N, both would pass validation,
         and a replayed token would go undetected (FR-02: "when the same refresh
-        token is submitted concurrently, at most one rotation succeeds")."""
-        stmt = select(SessionModel).where(SessionModel.id == session_id).with_for_update()
+        token is submitted concurrently, at most one rotation succeeds").
+
+        **Lock order: `users` before `sessions`.** A caller that needs both -
+        refresh does, since VS-004 - must take the user lock first. A password
+        reset locks the user row and then updates that user's session rows, so a
+        caller acquiring them the other way round closes a deadlock cycle. See
+        `RefreshSession.execute`.
+
+        `populate_existing` because that caller reads the session unlocked first
+        (to learn whose it is), which leaves a stale instance in the identity
+        map; without it SQLAlchemy would hand that back instead of the row as it
+        stands under the lock."""
+        stmt = (
+            select(SessionModel)
+            .where(SessionModel.id == session_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
         model = await self._session.scalar(stmt)
         return _session_to_domain(model) if model else None
 
@@ -209,6 +290,29 @@ class SessionRepository:
         model.revoked_at = session.revoked_at
         model.reuse_detected_at = session.reuse_detected_at
         await self._session.flush()
+
+    async def revoke_all_for_user(self, *, user_id: UUID, at: datetime) -> int:
+        """Revoke every live session this user has. Returns how many died.
+
+        SEC-08 requires this on password change, and it is deliberately one
+        UPDATE rather than a load-mutate-save loop over Session entities: the
+        point of the operation is that no session survives it, and a loop leaves
+        a window in which a session created after the read is missed. The
+        `revoked_at IS NULL` filter makes it idempotent and keeps an earlier
+        revocation timestamp - including a `reuse_detected_at` one - intact.
+
+        A session created *concurrently* by an in-flight MFA login is handled by
+        the caller holding the user row lock, not by this statement - see
+        UserRepository.get_by_id_for_update."""
+        stmt = (
+            update(SessionModel)
+            .where(SessionModel.user_id == user_id, SessionModel.revoked_at.is_(None))
+            .values(revoked_at=at)
+            .returning(SessionModel.id)
+        )
+        revoked_ids = (await self._session.scalars(stmt)).all()
+        await self._session.flush()
+        return len(revoked_ids)
 
 
 class VerificationTokenRepository:
@@ -396,3 +500,77 @@ class MfaRecoveryCodeRepository:
             raise ValueError(f"MfaRecoveryCode {code.id} not found")
         model.used_at = code.used_at
         await self._session.flush()
+
+
+class PasswordResetTokenRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_by_hash_for_update(self, token_hash: str) -> PasswordResetToken | None:
+        """Read one reset token and hold a row lock until the transaction ends.
+
+        Single-use is a business invariant, and an application-level `used_at IS
+        NULL` check loses the race on its own: two requests carrying the same
+        token would both read an unused row, both mark it used, and both replace
+        the password. `SELECT ... FOR UPDATE` makes the second transaction block
+        here and then re-read the row the first one already burned, so it
+        correctly sees the token as spent. Same mechanism as
+        SessionRepository.get_for_update, for the same reason."""
+        stmt = (
+            select(PasswordResetTokenModel)
+            .where(PasswordResetTokenModel.token_hash == token_hash)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        model = await self._session.scalar(stmt)
+        return _reset_token_to_domain(model) if model else None
+
+    async def get_latest_for_user(self, user_id: UUID) -> PasswordResetToken | None:
+        stmt = (
+            select(PasswordResetTokenModel)
+            .where(PasswordResetTokenModel.user_id == user_id)
+            .order_by(PasswordResetTokenModel.created_at.desc())
+            .limit(1)
+        )
+        model = await self._session.scalar(stmt)
+        return _reset_token_to_domain(model) if model else None
+
+    async def add(
+        self, *, user_id: UUID, token_hash: str, expires_at: datetime
+    ) -> PasswordResetToken:
+        model = PasswordResetTokenModel(
+            user_id=user_id, token_hash=token_hash, expires_at=expires_at
+        )
+        self._session.add(model)
+        await self._session.flush()
+        await self._session.refresh(model)
+        return _reset_token_to_domain(model)
+
+    async def save(self, token: PasswordResetToken) -> None:
+        model = await self._session.get(PasswordResetTokenModel, token.id)
+        if model is None:
+            raise ValueError(f"PasswordResetToken {token.id} not found")
+        model.used_at = token.used_at
+        await self._session.flush()
+
+    async def consume_outstanding_for_user(self, *, user_id: UUID, at: datetime) -> int:
+        """Burn every unused reset token this user holds. Returns how many.
+
+        Called after a successful reset. Without it, a second link the user
+        requested earlier stays redeemable for the rest of its window, so an
+        attacker who later reaches that older email can reset the password
+        again - the account would be recoverable by someone who was never
+        supposed to hold a live token. Same reasoning as revoking sessions:
+        one successful reset must end every other route in."""
+        stmt = (
+            update(PasswordResetTokenModel)
+            .where(
+                PasswordResetTokenModel.user_id == user_id,
+                PasswordResetTokenModel.used_at.is_(None),
+            )
+            .values(used_at=at)
+            .returning(PasswordResetTokenModel.id)
+        )
+        consumed_ids = (await self._session.scalars(stmt)).all()
+        await self._session.flush()
+        return len(consumed_ids)

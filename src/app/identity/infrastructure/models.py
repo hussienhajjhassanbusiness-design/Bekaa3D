@@ -45,6 +45,12 @@ class UserModel(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+    # ADR-018. BigInteger rather than Integer: it only ever increases, and while
+    # overflowing a 32-bit counter would take an implausible number of resets,
+    # the wider column costs nothing and a wrapped epoch would re-validate old
+    # credentials. NOT NULL with a server default so every existing row migrates
+    # to 0 - the same value a token minted before this claim existed decodes to.
+    auth_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
 
     __table_args__ = (
         Index(
@@ -122,6 +128,42 @@ class VerificationTokenModel(Base):
         # need indexing by date.
         Index(
             "ix_verification_tokens_expires_at_live",
+            "expires_at",
+            postgresql_where=text("used_at IS NULL"),
+        ),
+    )
+
+
+class PasswordResetTokenModel(Base):
+    """database-design.md 5.5. Only the SHA-256 hash of the token is stored, so
+    a database leak yields nothing that can be redeemed on the reset endpoint.
+
+    Sits beside VerificationTokenModel rather than sharing it: the two prove
+    different things, and one table would make a verification token redeemable
+    at the reset endpoint."""
+
+    __tablename__ = "password_reset_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_password_reset_tokens_user_id", "user_id"),
+        # database-design.md 19.11 lists password_reset_tokens(expires_at) for
+        # the retention purge. Partial on used_at IS NULL: rows already redeemed
+        # are found by the same scan and do not need to be indexed by date.
+        Index(
+            "ix_password_reset_tokens_expires_at_live",
             "expires_at",
             postgresql_where=text("used_at IS NULL"),
         ),

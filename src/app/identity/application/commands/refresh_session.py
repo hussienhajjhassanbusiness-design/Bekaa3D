@@ -47,9 +47,29 @@ class RefreshSession:
     ) -> RefreshResult:
         claims = decode_refresh_token(raw_refresh_token)
 
-        # FOR UPDATE. Everything below runs while this row is locked, so two
-        # simultaneous refreshes of the same token serialise here and the
-        # second one correctly sees the first one's rotation.
+        # Lock order: `users` first, then `sessions`. A password reset takes the
+        # user row and then updates that user's session rows, so acquiring them
+        # the other way round here would close a deadlock cycle - which is
+        # exactly what this path used to do, since VS-003 locked the session row
+        # straight away and never touched the user row at all.
+        #
+        # Getting the user id therefore needs an unlocked peek first. Nothing is
+        # decided on it: it identifies which user row to lock and nothing more,
+        # and every condition that matters is revalidated below against the
+        # locked re-read.
+        owner_id = await self._sessions.get_owner_id(claims.session_id)
+        if owner_id is None:
+            raise InvalidSessionError()
+
+        # 1. The user row. Held for the rest of the transaction, so a reset
+        #    either finished before this line or cannot start until after this
+        #    transaction ends.
+        user = await self._users.get_by_id_for_update(owner_id)
+
+        # 2. Now the session row. `populate_existing` matters: the unlocked peek
+        #    above may have put a stale instance in the identity map, and
+        #    without it SQLAlchemy would hand that back instead of the row as it
+        #    stands under the lock.
         session = await self._sessions.get_for_update(claims.session_id)
         if session is None:
             raise InvalidSessionError()
@@ -81,7 +101,6 @@ class RefreshSession:
             )
             raise
 
-        user = await self._users.get_by_id(session.user_id)
         if user is None or not user.can_authenticate:
             # Deactivated or anonymised between login and refresh: the session
             # must not survive its owner. Like the reuse branch above, this
@@ -114,6 +133,12 @@ class RefreshSession:
                 # to MFA-incomplete every time the access token is renewed.
                 # Defaults False so a caller that does not track it fails closed.
                 mfa_completed=mfa_completed,
+                # From the locked user row, so a reset cannot land between the
+                # rotation and the stamp. A reset that landed *before* this
+                # transaction got the lock has already revoked the session, and
+                # `authorize_rotation` above refuses a revoked session - so this
+                # line is never reached with a stale epoch.
+                auth_epoch=user.auth_epoch,
             ),
             refresh_token=refresh_token,
             csrf_token=csrf_token_for_session(session.id),

@@ -4,6 +4,7 @@ Identity owns authentication, so other bounded contexts depend on these rather
 than decoding cookies themselves - one place decides what "authenticated"
 means, and one place decides the error contract for failing it."""
 
+import structlog
 from fastapi import Depends, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +18,8 @@ from app.identity.domain.exceptions import InvalidSessionError
 from app.identity.infrastructure.repositories import UserRepository
 from app.identity.infrastructure.session_tokens import AccessTokenClaims, decode_access_token
 
+logger = structlog.get_logger()
+
 CSRF_HEADER = "X-CSRF-Token"
 
 
@@ -29,20 +32,49 @@ def unauthenticated_error() -> ApiError:
     )
 
 
-async def current_claims(request: Request) -> AccessTokenClaims:
-    """Read the access-token cookie, or 401.
+async def current_claims(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> AccessTokenClaims:
+    """Read the access-token cookie, verify it, or 401.
 
-    Note this trusts the signed token for the length of its 15-minute life and
-    does not read the `sessions` row. That is the deliberate trade in ADR-006:
-    revocation takes effect at the next refresh rather than instantly, which is
-    what keeps ordinary authenticated reads free of a database round-trip."""
+    Two checks, in this order. The signature and standard claims first, so a
+    forged or expired token is refused with no database traffic at all and an
+    unauthenticated caller cannot use this path to generate load. Then one
+    indexed scalar read of `users.auth_epoch`: the token records the epoch it
+    was minted under, and this refuses it once the account has moved past that.
+
+    This is the part of ADR-006 that ADR-018 supersedes. ADR-006 traded
+    revocation latency for a database-free authenticated path, and the trade was
+    reasonable until VS-004 made immediate revocation a security requirement:
+    without this read a password reset left every access token it had just
+    revoked working for the remainder of its fifteen minutes.
+
+    The epoch is read from PostgreSQL rather than a cache. It is the authority
+    for an authentication decision, and a cache that answers *successfully* with
+    a lost key - a restarted Redis, an evicted entry, a restored snapshot -
+    would silently re-validate revoked credentials. That failure looks like
+    normal operation, which is exactly what makes it unacceptable.
+    """
     raw = request.cookies.get(ACCESS_COOKIE)
     if not raw:
         raise unauthenticated_error()
     try:
-        return decode_access_token(raw)
+        claims = decode_access_token(raw)
     except InvalidSessionError as exc:
         raise unauthenticated_error() from exc
+
+    current_epoch = await UserRepository(session).get_auth_epoch(claims.user_id)
+    if current_epoch is None:
+        # The account was hard-deleted (only ever the unverified-purge job) while
+        # a token was still live.
+        raise unauthenticated_error()
+    if claims.auth_epoch != current_epoch:
+        # Not `<`: an epoch ahead of the account's own is as impossible as one
+        # behind it, and equality is the only relation that cannot be satisfied
+        # by a stale credential.
+        raise unauthenticated_error()
+    return claims
 
 
 async def current_user(
@@ -51,9 +83,16 @@ async def current_user(
 ) -> User:
     """Load the authenticated user's own row, or 401.
 
-    Use this only where the row is needed anyway. `current_claims` deliberately
-    avoids the database (ADR-006), so routes that need nothing beyond the token
-    should keep depending on it directly rather than paying for this read.
+    Use this only where the row is needed anyway; routes that need nothing
+    beyond the token should keep depending on `current_claims` directly.
+
+    Note this costs a *second* query on the same row: since ADR-018,
+    `current_claims` already reads `users.auth_epoch`. That is one extra
+    primary-key lookup on the only route that uses this dependency
+    (`GET /api/v1/me`), and collapsing the two is recorded as a performance
+    follow-up rather than fixed here - the obvious fix, having `current_claims`
+    hydrate the whole row, would make every authenticated request pay for a full
+    read (password hash included) to spare one route a scalar one.
 
     Because the read happens regardless here, it also re-checks
     `can_authenticate` rather than trusting the token for its full 15 minutes:

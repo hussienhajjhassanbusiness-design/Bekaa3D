@@ -174,3 +174,27 @@ class UserProfileRead(BaseModel):
             email_verified_at=user.email_verified_at,
             created_at=user.created_at,
         )
+
+
+class PasswordResetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token: str
+    # Same floor as RegisterRequest, and for the same BR-120 reason. A password
+    # set through a reset must be no weaker than one set at registration, so the
+    # two constraints are deliberately identical rather than merely similar.
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+class PasswordResetAccepted(BaseModel):
+    """Separate from RegistrationAccepted despite the same shape: the message is
+    the only thing a caller ever learns from this endpoint, so it must not start
+    talking about verification if the registration copy is ever reworded."""
+
+    message: str = "If an account exists for that address, a reset email has been sent."

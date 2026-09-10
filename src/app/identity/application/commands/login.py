@@ -1,3 +1,4 @@
+import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
@@ -62,13 +63,23 @@ class Login:
     ) -> LoginResult | MfaChallengeRequired:
         await self._throttle.check(email=email, ip=ip)
 
+        # Unlocked. Argon2 costs ~80ms by design, and this is a public,
+        # unauthenticated endpoint: holding a `users` row lock across that would
+        # let anyone who knows an address serialise every operation touching it
+        # - other logins, a refresh, a password reset - for 80ms per request,
+        # simply by guessing. The lock is taken below instead, after the
+        # expensive work is done, and the credential is re-checked under it.
         user = await self._users.get_by_email(email)
         if user is None:
             verify_password(password=password, password_hash=_DUMMY_PASSWORD_HASH)
             await self._throttle.record_failure(email=email, ip=ip)
             raise InvalidCredentialsError()
 
-        if not verify_password(password=password, password_hash=user.password_hash):
+        # Captured, not re-read. This exact string is the credential version
+        # Argon2 is about to authenticate, and it is what the locked row is
+        # compared against afterwards - see below.
+        verified_hash = user.password_hash
+        if not verify_password(password=password, password_hash=verified_hash):
             await self._throttle.record_failure(email=email, ip=ip)
             raise InvalidCredentialsError()
 
@@ -79,7 +90,43 @@ class Login:
         if not user.can_authenticate:
             raise AccountDisabledError(user.id)
 
+        # Before the lock: the password was correct, so the counters for this
+        # (email, IP) should clear regardless of how the rest of this request
+        # turns out. Keeps the throttle Redis round-trip outside the lock too.
         await self._throttle.reset(email=email, ip=ip)
+
+        # The lock, taken now that the expensive work is behind us. Everything
+        # from here to the session insert runs against a row nothing else can
+        # change, in the project's canonical `users`-then-`sessions` order.
+        user = await self._users.get_by_id_for_update(user.id)
+        if user is None:
+            # The account was deleted between the two reads.
+            raise InvalidCredentialsError()
+
+        # Re-checked under the lock rather than trusted from the unlocked read:
+        # an account can be deactivated inside the ~80ms window above.
+        if not user.can_authenticate:
+            raise AccountDisabledError(user.id)
+
+        # The credential-version check, and the reason the lock can be taken
+        # late at all. A password reset committing during the verification above
+        # would otherwise leave this login minting a session from a credential
+        # the database no longer holds - and worse, stamping it with the *new*
+        # `auth_epoch` read below, so it would sail past every revocation check
+        # the reset had just armed (ADR-018).
+        #
+        # Comparing the encoded hashes establishes that the stored credential is
+        # still the exact one Argon2 authenticated. Nothing rehashes on login,
+        # so the string is stable for an unchanged password; if a
+        # rehash-on-verify policy is ever added, this needs an explicit
+        # credential-version column instead. `compare_digest` rather than `==`
+        # to keep the comparison free of a timing signal, matching
+        # `Session.authorize_rotation`.
+        if not secrets.compare_digest(user.password_hash, verified_hash):
+            # Deliberately the ordinary invalid-credentials answer. A distinct
+            # error here would tell the caller that this address exists *and*
+            # that its password was being changed at that moment.
+            raise InvalidCredentialsError()
 
         # ---- VS-005 MFA integration (SEC-04, api-endpoints.md:252) ----------
         # The password has proven the caller owns this account, but for an
@@ -108,7 +155,7 @@ class Login:
                 request_id=request_id,
                 ip_hash=ip_hash,
             )
-            return MfaChallengeRequired(user_id=user.id)
+            return MfaChallengeRequired(user_id=user.id, auth_epoch=user.auth_epoch)
         # ---- end VS-005 MFA integration -------------------------------------
 
         settings = get_settings()
@@ -149,6 +196,9 @@ class Login:
                 role=user.role,
                 email_verified=user.is_verified,
                 now=now,
+                # From the locked row. A later reset advances it and invalidates
+                # this token immediately rather than at its next refresh.
+                auth_epoch=user.auth_epoch,
             ),
             refresh_token=refresh_token,
             csrf_token=csrf_token_for_session(session_id),

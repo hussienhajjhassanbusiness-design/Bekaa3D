@@ -23,6 +23,7 @@ Only expensive-to-reverse decisions belong here. Folder names and small refactor
 - [ADR-015: Partition downloads and audit logs by month](ADR-015-partition-high-volume-logs.md)
 - [ADR-016: Launch V1 English-only](ADR-016-english-only-v1.md)
 - [ADR-017: Gate admin login on MFA rather than stepping up an existing session](ADR-017-login-gated-admin-mfa.md)
+- [ADR-018: Store a per-user authentication epoch in PostgreSQL and check it on every authenticated request](ADR-018-authentication-epoch.md)
 
 ## Governance
 
