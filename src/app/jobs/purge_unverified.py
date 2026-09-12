@@ -3,8 +3,8 @@ from typing import Any
 
 import structlog
 
-from app.core.config import get_settings
 from app.identity.infrastructure.repositories import UserRepository
+from app.platform.application.services.settings_reader import SettingsReader
 
 logger = structlog.get_logger()
 
@@ -18,20 +18,33 @@ async def purge_unverified_accounts(ctx: dict[str, Any]) -> int:
     those are anonymised through the account-deletion flow instead
     (database-design.md 5.1).
 
-    The retention period is read from settings today; VS-007 turns it into an
-    admin-editable database setting and replaces only this one lookup.
-    """
-    settings = get_settings()
-    cutoff = datetime.now(UTC) - timedelta(days=settings.unverified_account_retention_days)
+    The retention period is the `unverified_account_purge_period` setting
+    (VS-007), read through the Platform settings service rather than from a
+    source-code constant - BR-133 requires business parameters to be
+    administrator-editable without a deployment.
 
+    There is deliberately **no fallback**. If the setting is missing or its
+    stored value is invalid, `SettingsReader` raises and this job fails visibly
+    in the worker log and the cron-liveness alert. A `30` quietly substituted
+    here would be the exact thing BR-133 forbids, and it would silently delete
+    accounts on a schedule nobody had approved - the failure mode is worse than
+    not running at all, because it is invisible.
+
+    Read inside the same transaction as the delete, so the cutoff and the rows
+    it selects come from one consistent snapshot.
+    """
     session_factory = ctx["session_factory"]
     async with session_factory() as session, session.begin():
+        retention_seconds = await SettingsReader(session).get_duration_seconds(
+            "unverified_account_purge_period"
+        )
+        cutoff = datetime.now(UTC) - timedelta(seconds=retention_seconds)
         purged = await UserRepository(session).purge_never_verified_before(cutoff)
 
     if purged:
         await logger.ainfo(
             "unverified_accounts_purged",
             count=purged,
-            retention_days=settings.unverified_account_retention_days,
+            retention_seconds=retention_seconds,
         )
     return purged

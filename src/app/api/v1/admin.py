@@ -18,5 +18,9 @@ whether or not that route exists - which is the point of SEC-10."""
 from fastapi import APIRouter, Depends
 
 from app.identity.api.dependencies import require_admin
+from app.platform.api.settings import admin_router as settings_router
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
+# VS-007. Mounted here rather than carrying its own guard, so the settings
+# editor inherits the one boundary instead of re-deriving it.
+router.include_router(settings_router)

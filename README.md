@@ -15,6 +15,7 @@ In development, following the vertical-slice plan in [`docs/requirments/vertical
 - **VS-004** — password reset, with every pre-reset session and MFA challenge invalidated
 - **VS-005** — administrator MFA (TOTP), login-gated admin sessions, one-time recovery codes, isolated `/api/v1/admin` boundary
 - **VS-006** — current customer profile (`GET /api/v1/me`)
+- **VS-007** — typed settings editor, seeded registry, and a strict public-settings allowlist
 
 Each slice adds one complete, tested, end-to-end capability. Build order follows the phased plan in the SRS — see [Build Phases](docs/SRS.md#28-build-phases).
 

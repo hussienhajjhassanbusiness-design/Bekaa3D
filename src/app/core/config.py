@@ -41,12 +41,6 @@ class Settings(BaseSettings):
     whish_webhook_ips: str = ""
     whish_verify_signature: bool = False
 
-    # FR-02 requires never-verified accounts to be purged after a configured
-    # period. VS-007 replaces this with the admin-editable DB setting
-    # (SRS 924 lists "unverified purge period"); until then the value lives
-    # here so the job has one place to read it from either way.
-    unverified_account_retention_days: int = 30
-
     email_provider: str = "console"
     email_provider_key: str = ""
     email_from: str = "no-reply@example.com"
