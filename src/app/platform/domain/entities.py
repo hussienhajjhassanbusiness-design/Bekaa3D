@@ -3,7 +3,8 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from app.platform.domain.enums import OutboxStatus
+from app.platform.domain.enums import OutboxStatus, SettingType
+from app.platform.domain.settings_registry import SettingValue
 
 MAX_OUTBOX_ATTEMPTS = 5
 
@@ -70,3 +71,45 @@ class AuditLogEntry:
     request_id: str | None
     ip_hash: str | None
     created_at: datetime
+
+
+@dataclass
+class Setting:
+    """One typed, administrator-editable business parameter.
+
+    The entity deliberately holds no validation rules: what a value may be is
+    declared once in `settings_registry`, and duplicating it here would create
+    two places to change a limit. What lives here is the one piece of behaviour
+    that is genuinely about this row - deciding whether a write is a change.
+    """
+
+    id: UUID
+    key: str
+    type: SettingType
+    value: SettingValue
+    description: str | None
+    updated_by: UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+    def change_value(self, new_value: SettingValue, *, actor_id: UUID, at: datetime) -> bool:
+        """Apply a validated value. Returns whether anything actually changed.
+
+        A PATCH that submits the value already stored is a successful request
+        that changes nothing, and the caller uses this answer to decide whether
+        to touch `updated_at`/`updated_by`. It is still audited - FR-18 requires
+        both of two concurrent attempts to be audited, and under last-commit
+        semantics the second one frequently *is* a no-op.
+
+        The type is compared as well as the value because Python treats
+        `True == 1` as true. Validation makes that unreachable for a registered
+        key, since a boolean setting rejects `1` and an integer setting rejects
+        `true` - but a comparison that would silently call those equal is not
+        one to leave sitting in an entity.
+        """
+        if type(self.value) is type(new_value) and self.value == new_value:
+            return False
+        self.value = new_value
+        self.updated_by = actor_id
+        self.updated_at = at
+        return True

@@ -28,8 +28,9 @@ Vertical slices merged so far (full plan: `docs/requirments/vertical-slice-plan.
 - **VS-004** — password reset with global revocation of pre-reset authentication state (`password_reset_tokens` table, enumeration-safe request, single-use token read `FOR UPDATE`, every session revoked and every outstanding MFA login challenge invalidated on confirm per SEC-08)
 - **VS-005** — administrator MFA and the admin security boundary (`mfa_credentials`/`mfa_recovery_codes`, encrypted TOTP secrets, login-gated admin sessions per ADR-017, hashed one-time recovery codes, `/api/v1/admin` behind `require_admin`)
 - **VS-006** — current customer profile: read-only `GET /api/v1/me`, `UserProfileRead`, `current_user` dependency (no migration, no write path — V1 defines no mutable profile field)
+- **VS-007** — typed settings editor and safe public settings (`settings` table seeded with the twelve SRS §15.4 parameters, code-side key registry, admin CRUD behind the VS-005 boundary, strict five-key public allowlist, `setting.updated` audit — see [`docs/settings-registry.md`](docs/settings-registry.md))
 
-**Next up: VS-007** (admin-editable settings) and VS-008 (notifications), both unblocked. VS-008 needs no migration, so it is the safe slice to run in parallel with anything holding the migration lock.
+**Next up: VS-008** (in-app notification centre) and VS-009 (admin user management), both unblocked — but they differ on the migration lock. VS-008 adds the `notifications` table and its indexes, so it **requires a migration** and must wait for the lock to be free. VS-009 expects **no migration** (it works on the existing `users` table), so it is the slice that can safely run in parallel with whoever holds the lock.
 
 Local dev stack (`docker-compose.yml`: postgres, redis, clamav, api, worker) — see README's Getting Started section for bootstrap commands and the current port-mapping note.
 

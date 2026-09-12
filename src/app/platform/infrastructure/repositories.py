@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -5,9 +6,9 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.platform.domain.entities import AuditLogEntry, EmailOutboxMessage
-from app.platform.domain.enums import OutboxStatus
-from app.platform.infrastructure.models import AuditLogModel, EmailOutboxModel
+from app.platform.domain.entities import AuditLogEntry, EmailOutboxMessage, Setting
+from app.platform.domain.enums import OutboxStatus, SettingType
+from app.platform.infrastructure.models import AuditLogModel, EmailOutboxModel, SettingModel
 
 
 def _outbox_to_domain(model: EmailOutboxModel) -> EmailOutboxMessage:
@@ -122,3 +123,111 @@ class AuditLogRepository:
             ip_hash=model.ip_hash,
             created_at=model.created_at,
         )
+
+
+def _setting_to_domain(model: SettingModel) -> Setting:
+    return Setting(
+        id=model.id,
+        key=model.key,
+        type=model.type,
+        value=model.value,
+        description=model.description,
+        updated_by=model.updated_by,
+        created_at=model.created_at,
+        updated_at=model.updated_at,
+    )
+
+
+class SettingRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_by_key(self, key: str) -> Setting | None:
+        """Unlocked read, for consumers that only need the current value."""
+        stmt = select(SettingModel).where(SettingModel.key == key)
+        model = await self._session.scalar(stmt)
+        return _setting_to_domain(model) if model else None
+
+    async def get_by_key_for_update(self, key: str) -> Setting | None:
+        """Read one setting and hold a row lock until the transaction ends.
+
+        This is what serialises two administrators editing the same key. The
+        second blocks here, then re-reads the row the first one committed, so
+        its audit entry records the value it genuinely replaced instead of a
+        stale one (FR-18: "deterministic ... last-commit behavior with both
+        attempts audited").
+
+        `populate_existing` matters for the same reason it did on the MFA
+        credential and the user row: without it SQLAlchemy returns the instance
+        already in this session's identity map, and the post-lock read would
+        hand back pre-lock data - which is precisely the value the lock exists
+        to invalidate.
+        """
+        stmt = (
+            select(SettingModel)
+            .where(SettingModel.key == key)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        model = await self._session.scalar(stmt)
+        return _setting_to_domain(model) if model else None
+
+    async def get_many(self, keys: Sequence[str]) -> dict[str, Setting]:
+        """The settings for an explicit list of keys, indexed by key.
+
+        Used by the public endpoint, which passes the allowlist. Reading only
+        the named keys - rather than reading everything and filtering in Python
+        - means a setting that is not on the allowlist never leaves the
+        database, so a filtering mistake cannot become a disclosure.
+        """
+        if not keys:
+            return {}
+        stmt = select(SettingModel).where(SettingModel.key.in_(keys))
+        models = (await self._session.scalars(stmt)).all()
+        return {model.key: _setting_to_domain(model) for model in models}
+
+    async def list_page(
+        self,
+        *,
+        limit: int,
+        after_key: str | None = None,
+        prefix: str | None = None,
+        setting_type: SettingType | None = None,
+    ) -> list[Setting]:
+        """One page of settings, ordered by key.
+
+        `key` is unique, so it is a complete sort order on its own and doubles
+        as the cursor - no separate tie-breaker is needed here, unlike the
+        `created_at` orderings elsewhere in the API (api-endpoints.md 2.2).
+
+        The caller asks for `limit + 1` rows to discover whether a further page
+        exists, which is why this returns a plain list and does no counting: a
+        `COUNT(*)` would be a second query to answer a question the extra row
+        already answers.
+        """
+        stmt = select(SettingModel).order_by(SettingModel.key.asc()).limit(limit)
+        if after_key is not None:
+            stmt = stmt.where(SettingModel.key > after_key)
+        if prefix:
+            # autoescape, or a prefix containing % or _ would be read as a LIKE
+            # wildcard and quietly match the wrong rows.
+            stmt = stmt.where(SettingModel.key.startswith(prefix, autoescape=True))
+        if setting_type is not None:
+            stmt = stmt.where(SettingModel.type == setting_type)
+        models = (await self._session.scalars(stmt)).all()
+        return [_setting_to_domain(model) for model in models]
+
+    async def save(self, setting: Setting) -> None:
+        """Persist a changed value.
+
+        `key`, `type` and `description` are absent on purpose: the key and its
+        declared type are schema-defined and the API cannot change them, and the
+        description belongs to the registry that the seed migration wrote.
+        """
+        model = await self._session.get(SettingModel, setting.id)
+        if model is None:
+            raise ValueError(f"Setting {setting.id} not found")
+        model.value = setting.value
+        model.updated_by = setting.updated_by
+        model.updated_at = setting.updated_at
+        await self._session.flush()
