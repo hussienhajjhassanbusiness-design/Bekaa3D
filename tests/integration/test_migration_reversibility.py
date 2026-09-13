@@ -19,7 +19,7 @@ from testcontainers.postgres import PostgresContainer
 
 from app.core.config import get_settings
 
-EXPECTED_ENUMS = {"user_role", "outbox_status"}
+EXPECTED_ENUMS = {"user_role", "outbox_status", "setting_type", "notification_type"}
 
 
 @pytest.mark.integration

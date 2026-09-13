@@ -18,8 +18,15 @@ from app.identity.infrastructure.repositories import (
 from app.identity.infrastructure.token_service import generate_raw_token, hash_token
 from app.platform.infrastructure.repositories import AuditLogRepository
 
-WINNING_PASSWORD = "the-one-that-should-stick"
-LOSING_PASSWORD = "the-one-that-should-not"
+# Deliberately neutral names. An earlier version called these WINNING_PASSWORD
+# and LOSING_PASSWORD and then asserted that the "winner" was the one in force
+# afterwards - which is not something this test is entitled to decide. Which
+# request wins is settled by which transaction reaches the token's row lock
+# first, and that is genuinely nondeterministic: it is the operating system's
+# scheduling, not the test's argument order. The names encode that neither is
+# expected to win.
+PASSWORD_A = "reset-candidate-alpha"
+PASSWORD_B = "reset-candidate-beta"
 
 
 async def _seed_reset_token(
@@ -40,19 +47,30 @@ async def _seed_reset_token(
 
 async def _confirm_once(
     session_factory: async_sessionmaker[AsyncSession], raw_token: str, new_password: str
-) -> None:
+) -> tuple[str, BaseException | None]:
     """One request's worth of work, transaction boundary included - the same
-    shape get_session gives the real route."""
-    async with session_factory() as db, db.begin():
-        use_case = ConfirmPasswordReset(
-            user_repo=UserRepository(db),
-            token_repo=PasswordResetTokenRepository(db),
-            session_repo=SessionRepository(db),
-            audit_repo=AuditLogRepository(db),
-        )
-        await use_case.execute(
-            raw_token=raw_token, new_password=new_password, request_id=None, ip_hash=None
-        )
+    shape get_session gives the real route.
+
+    Returns the password it submitted alongside its outcome, so the caller can
+    tell *which* attempt won rather than having to assume. `asyncio.gather`
+    preserves argument order, but the order in which two racing transactions
+    acquire a row lock has nothing to do with the order they were passed in, so
+    identity has to travel with the result.
+    """
+    try:
+        async with session_factory() as db, db.begin():
+            use_case = ConfirmPasswordReset(
+                user_repo=UserRepository(db),
+                token_repo=PasswordResetTokenRepository(db),
+                session_repo=SessionRepository(db),
+                audit_repo=AuditLogRepository(db),
+            )
+            await use_case.execute(
+                raw_token=raw_token, new_password=new_password, request_id=None, ip_hash=None
+            )
+    except Exception as exc:
+        return new_password, exc
+    return new_password, None
 
 
 @pytest.mark.integration
@@ -66,20 +84,36 @@ async def test_one_reset_token_submitted_twice_at_once_is_redeemed_once(
     would read the same unused row, both would pass the `used_at IS NULL` check,
     and both would write a password - so whichever committed last would decide
     the account's credential. An attacker racing the real user for a token they
-    both hold would win roughly half the time."""
+    both hold would win roughly half the time.
+
+    What this test asserts is the *invariant*, not the schedule: exactly one
+    attempt succeeds, exactly one is rejected as an invalid token, the stored
+    credential is the successful attempt's password, and the token is spent
+    once. Either attempt may be the winner and both outcomes are correct.
+    """
     session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
     user_id, raw_token = await _seed_reset_token(session_factory)
 
     outcomes = await asyncio.gather(
-        _confirm_once(session_factory, raw_token, WINNING_PASSWORD),
-        _confirm_once(session_factory, raw_token, LOSING_PASSWORD),
-        return_exceptions=True,
+        _confirm_once(session_factory, raw_token, PASSWORD_A),
+        _confirm_once(session_factory, raw_token, PASSWORD_B),
     )
 
-    successes = [o for o in outcomes if o is None]
-    rejections = [o for o in outcomes if isinstance(o, InvalidPasswordResetTokenError)]
-    assert len(successes) == 1, outcomes
-    assert len(rejections) == 1, outcomes
+    succeeded = [password for password, error in outcomes if error is None]
+    rejected = [(password, error) for password, error in outcomes if error is not None]
+
+    assert len(succeeded) == 1, outcomes
+    assert len(rejected) == 1, outcomes
+    # The loser must fail *for the right reason*. Any other exception would mean
+    # the second request crashed rather than being correctly refused, which is a
+    # different bug wearing the same shape.
+    assert isinstance(rejected[0][1], InvalidPasswordResetTokenError), outcomes
+
+    successful_password = succeeded[0]
+    rejected_password = rejected[0][0]
+    # Both attempts are accounted for, so a result that silently dropped one
+    # cannot pass the checks below by coincidence.
+    assert {successful_password, rejected_password} == {PASSWORD_A, PASSWORD_B}
 
     async with session_factory() as db:
         user = await UserRepository(db).get_by_id(user_id)
@@ -90,9 +124,10 @@ async def test_one_reset_token_submitted_twice_at_once_is_redeemed_once(
         )
 
     assert user is not None
-    # Exactly one of the two passwords is in force, and the loser's is not.
-    assert not verify_password(password=LOSING_PASSWORD, password_hash=user.password_hash)
-    assert verify_password(password=WINNING_PASSWORD, password_hash=user.password_hash)
+    # The credential in force belongs to the attempt that actually succeeded -
+    # derived from the outcomes, never assumed from argument order.
+    assert verify_password(password=successful_password, password_hash=user.password_hash)
+    assert not verify_password(password=rejected_password, password_hash=user.password_hash)
     assert len(rows) == 1
     assert rows[0].used_at is not None
 
@@ -109,9 +144,8 @@ async def test_resets_for_different_accounts_do_not_block_each_other(
     _, second_token = await _seed_reset_token(session_factory)
 
     outcomes = await asyncio.gather(
-        _confirm_once(session_factory, first_token, WINNING_PASSWORD),
-        _confirm_once(session_factory, second_token, WINNING_PASSWORD),
-        return_exceptions=True,
+        _confirm_once(session_factory, first_token, PASSWORD_A),
+        _confirm_once(session_factory, second_token, PASSWORD_B),
     )
 
-    assert all(o is None for o in outcomes), outcomes
+    assert [error for _, error in outcomes if error is not None] == [], outcomes

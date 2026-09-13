@@ -436,7 +436,7 @@ The API never returns a public STL master path.
 | Method + Path | Auth / Authorization | Request | Success | Errors | Pagination / Filter / Sort | Side Effects / Notes |
 |---|---|---|---|---|---|---|
 | `GET /api/v1/me/notifications` | Authenticated | query params | `200 NotificationPage` | 401 | Cursor; optional `read`; default `-created_at` | Own notifications |
-| `PATCH /api/v1/me/notifications/{notification_id}` | Verified Customer; owner | `NotificationUpdate` | `200 NotificationRead` | 401, 404, 422 | — | Sets read/unread state |
+| `PATCH /api/v1/me/notifications/{notification_id}` | Verified Customer; owner | `NotificationUpdate` | `200 NotificationRead` | 401, 403, 404, 422 | — | Sets read/unread state |
 
 ---
 
