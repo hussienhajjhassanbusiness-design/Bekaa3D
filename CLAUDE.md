@@ -29,8 +29,9 @@ Vertical slices merged so far (full plan: `docs/requirments/vertical-slice-plan.
 - **VS-005** — administrator MFA and the admin security boundary (`mfa_credentials`/`mfa_recovery_codes`, encrypted TOTP secrets, login-gated admin sessions per ADR-017, hashed one-time recovery codes, `/api/v1/admin` behind `require_admin`)
 - **VS-006** — current customer profile: read-only `GET /api/v1/me`, `UserProfileRead`, `current_user` dependency (no migration, no write path — V1 defines no mutable profile field)
 - **VS-007** — typed settings editor and safe public settings (`settings` table seeded with the twelve SRS §15.4 parameters, code-side key registry, admin CRUD behind the VS-005 boundary, strict five-key public allowlist, `setting.updated` audit — see [`docs/settings-registry.md`](docs/settings-registry.md))
+- **VS-008** — in-app notification centre (`notifications` table with a six-value `notification_type` enum and a partial unread index, `GET/PATCH /api/v1/me/notifications`, Engagement-local keyset pagination, `current_verified_user` dependency, and `create_notification` as the only cross-context write port — see [`docs/notification-contract.md`](docs/notification-contract.md))
 
-**Next up: VS-008** (in-app notification centre) and VS-009 (admin user management), both unblocked — but they differ on the migration lock. VS-008 adds the `notifications` table and its indexes, so it **requires a migration** and must wait for the lock to be free. VS-009 expects **no migration** (it works on the existing `users` table), so it is the slice that can safely run in parallel with whoever holds the lock.
+**Next up: VS-009** (admin user management), which expects **no migration** — it works on the existing `users` table — so it needs no lock and can run in parallel with whichever slice holds one.
 
 Local dev stack (`docker-compose.yml`: postgres, redis, clamav, api, worker) — see README's Getting Started section for bootstrap commands and the current port-mapping note.
 

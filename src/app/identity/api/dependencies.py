@@ -104,6 +104,36 @@ async def current_user(
     return user
 
 
+async def current_verified_user(user: User = Depends(current_user)) -> User:
+    """The authenticated user, refused unless their email is verified.
+
+    api-endpoints.md 3 defines "Verified Customer" as "Authenticated + verified
+    email", and this is the first dependency to enforce it - every write path
+    built so far has lived inside Identity, where verification was checked by
+    the use case itself.
+
+    Built on `current_user`, which re-reads the row, rather than on the token's
+    `ver` claim. The claim is minted at login and lives for the access token's
+    fifteen minutes, so a customer who verifies their email would otherwise keep
+    being refused their own writes for up to a quarter of an hour after the
+    state actually changed. One extra primary-key read on a write path is a
+    trivial price for the dependency being *correct* rather than eventually
+    correct.
+
+    Deliberately no role check. "Verified Customer" is an authentication level
+    in that table, not a role that excludes administrators, and adding a denial
+    rule here would invent behaviour no document describes.
+    """
+    if not user.is_verified:
+        raise ApiError(
+            status_code=status.HTTP_403_FORBIDDEN,
+            code="EMAIL_VERIFICATION_REQUIRED",
+            title="Email verification required",
+            detail="Verify your email address before making this change.",
+        )
+    return user
+
+
 async def require_csrf(
     request: Request, claims: AccessTokenClaims = Depends(current_claims)
 ) -> AccessTokenClaims:

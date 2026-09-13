@@ -16,6 +16,7 @@ In development, following the vertical-slice plan in [`docs/requirments/vertical
 - **VS-005** — administrator MFA (TOTP), login-gated admin sessions, one-time recovery codes, isolated `/api/v1/admin` boundary
 - **VS-006** — current customer profile (`GET /api/v1/me`)
 - **VS-007** — typed settings editor, seeded registry, and a strict public-settings allowlist
+- **VS-008** — in-app notification centre (`notifications` table, own-user list with cursor pagination, read/unread mutation, `create_notification` write port)
 
 Each slice adds one complete, tested, end-to-end capability. Build order follows the phased plan in the SRS — see [Build Phases](docs/SRS.md#28-build-phases).
 
