@@ -117,7 +117,7 @@ balance or card are never locked out; they use WhatsApp.
 2. A customer can order a physical product online and track it to delivery or pickup.
 3. A customer can reach the business via WhatsApp for anything the platform doesn't transact.
 4. The administrator can operate the entire business from the dashboard without database access.
-5. Both languages are fully usable, including right-to-left layout.
+5. The English storefront is fully usable end to end. V1 is English-only — see ADR-016.
 6. No payment can be granted without independent server-side verification.
 
 ---
@@ -202,7 +202,7 @@ Every rule is numbered for traceability. `BR-` prefix.
 | BR-030 | Checkout requires a verified account. There is no guest checkout.                                                                  |
 | BR-031 | All prices, shipping, and totals are recomputed server-side; client-supplied amounts are never trusted.                            |
 | BR-032 | Each order carries a human-readable order number.                                                                                  |
-| BR-033 | Order lines snapshot product name (both languages), price, and image at purchase; later catalogue edits never alter order history. |
+| BR-033 | Order lines snapshot product name, price, and image at purchase; later catalogue edits never alter order history. |
 | BR-034 | An order's fulfillment method is Delivery, Pickup, or none (digital-only orders).                                                  |
 | BR-035 | Order status is a derived projection of payment status and line statuses; it is never set directly.                                |
 | BR-036 | Each order line carries its own fulfillment status.                                                                                |
@@ -565,7 +565,7 @@ Complete inventory. `F-` prefix. Phase indicates build order (§28).
 
 ### 6.1 Product Attributes
 
-**Common to both types:** name*, description*, category, price, multiple images, visibility flag, featured flag, SEO metadata* (title, description, OG image, slug). Fields marked * are per-language.
+**Common to both types:** name, description, category, price, multiple images, visibility flag, featured flag, SEO metadata (title, description, OG image, slug). Catalogue text lives in plain columns on the owning table — V1 is English-only, see ADR-016 and §17.2.
 
 **Physical only:** purchase mode, material, colour, dimensions, production lead time (days), batch size, maximum quantity per line, availability toggle, weight (optional, reserved for future weight-based shipping).
 
@@ -656,7 +656,7 @@ Checkout requires an `Idempotency-Key` header. A repeated key with a matching re
 
 An order carries: order number, customer, source (cart or offer), derived status, fulfillment method, monetary breakdown (subtotal, shipping, tax=0, total, currency), address snapshot, shipping zone and rate snapshot, customer note, internal admin note, estimated dispatch date, and lifecycle timestamps.
 
-Each line carries: product reference, type, name snapshot (both languages), image snapshot, unit price, quantity, line total, its own fulfillment status, lead time and batch size snapshots, and an optional offer reference.
+Each line carries: product reference, type, name snapshot, image snapshot, unit price, quantity, line total, its own fulfillment status, lead time and batch size snapshots, and an optional offer reference.
 
 ### 8.2 Why Per-Line Status
 
