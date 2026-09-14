@@ -3,7 +3,10 @@
 # ---- Builder: compile deps into a venv ----
 FROM python:3.13-slim AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Use HTTPS to avoid transparent HTTP caches serving mismatched archives.
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -22,7 +25,10 @@ RUN pip install --no-cache-dir --upgrade pip \
 # ---- Runtime: slim image, no compilers ----
 FROM python:3.13-slim AS runtime
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Use HTTPS to avoid transparent HTTP caches serving mismatched archives.
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
     && rm -rf /var/lib/apt/lists/* \
