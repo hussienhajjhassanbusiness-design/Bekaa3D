@@ -173,3 +173,25 @@ class PasswordResetTokenExpiredError(IdentityDomainError):
     def __init__(self, token_id: UUID) -> None:
         super().__init__(f"Password reset token {token_id} has expired.")
         self.token_id = token_id
+
+
+class AccountNotMutableError(IdentityDomainError):
+    """An anonymised or soft-deleted account cannot be activated or deactivated.
+
+    Anonymisation and deletion are terminal in V1 - there is no restore
+    operation - so `is_active` on such a row means nothing: flipping it to true
+    could not make the account usable (`can_authenticate` still refuses it), and
+    flipping it to false would imply the account was live until an administrator
+    intervened. Both would leave an audit trail describing a transition that did
+    not happen.
+
+    The route maps this to the existing `409 INVALID_STATE_TRANSITION` rather
+    than inventing a code: "requested state-machine transition is illegal"
+    (api-endpoints.md 182) describes it exactly, and the error catalogue is a
+    contract rather than a place to add synonyms. Same reasoning, and the same
+    mapping, as Catalog's `ArchivedValueNotMutableError`.
+    """
+
+    def __init__(self, user_id: UUID) -> None:
+        super().__init__(f"User {user_id} is anonymised or deleted and cannot be modified.")
+        self.user_id = user_id

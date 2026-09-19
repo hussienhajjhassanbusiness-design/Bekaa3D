@@ -198,3 +198,68 @@ class PasswordResetAccepted(BaseModel):
     talking about verification if the registration copy is ever reworded."""
 
     message: str = "If an account exists for that address, a reset email has been sent."
+
+
+# --------------------------------------------------------------------------
+# Admin user management (VS-009)
+# --------------------------------------------------------------------------
+
+
+class AdminUserDetail(BaseModel):
+    """One account as an administrator sees it (api-endpoints.md 530-532).
+
+    V1 design assumption: the endpoint catalogue fixes the schema *names* and
+    describes the content as "account status and admin-safe customer summary"
+    without listing fields. This is VS-006's `UserProfileRead` plus the two
+    pieces of account state an administrator manages and a customer cannot see -
+    `is_active`, and `created_at` as the account's age.
+
+    Used for both the list items and the detail response. There is no separate
+    profile table, so a narrower list row would differ from this one only by
+    omitting fields the same query already loaded.
+
+    Nothing derived from `password_hash` appears, at any remove, and neither
+    `anonymized_at` nor `deleted_at` is exposed: V1 has no endpoint that sets
+    them, so they would be a column this API describes but cannot explain.
+    """
+
+    id: UUID
+    email: EmailStr
+    role: UserRole
+    is_active: bool
+    email_verified_at: datetime | None
+    created_at: datetime
+
+    @classmethod
+    def from_user(cls, user: User) -> "AdminUserDetail":
+        return cls(
+            id=user.id,
+            email=user.email,
+            role=user.role,
+            is_active=user.is_active,
+            email_verified_at=user.email_verified_at,
+            created_at=user.created_at,
+        )
+
+
+class AdminUserPage(BaseModel):
+    """The project's standard cursor page (api-endpoints.md 2.1):
+    `next_cursor = null` means there is no next page."""
+
+    items: list[AdminUserDetail]
+    next_cursor: str | None
+
+
+class AdminUserUpdate(BaseModel):
+    """The only writable field on an account, for anyone, in V1.
+
+    `extra="forbid"` is doing real work here rather than following the house
+    style: it is what makes a request carrying `role` or `email` a loud 422
+    instead of a silent no-op that the caller reasonably reads as success.
+    api-endpoints.md 532 is explicit that this endpoint offers
+    "activation/deactivation controls" and no arbitrary field editing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    is_active: bool

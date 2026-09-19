@@ -3,7 +3,17 @@ from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import CursorResult, delete, func, select, update
+from sqlalchemy import (
+    CursorResult,
+    DateTime,
+    delete,
+    func,
+    literal,
+    select,
+    tuple_,
+    update,
+)
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.identity.domain.entities import (
@@ -120,6 +130,72 @@ class UserRepository:
     async def get_by_id(self, user_id: UUID) -> User | None:
         model = await self._session.get(UserModel, user_id)
         return _user_to_domain(model) if model else None
+
+    async def list_page(
+        self,
+        *,
+        limit: int,
+        after: tuple[datetime, UUID] | None = None,
+        verified: bool | None = None,
+        active: bool | None = None,
+        search: str | None = None,
+    ) -> list[User]:
+        """One page of accounts for the admin list, newest first (VS-009).
+
+        Sort is fixed to `-created_at` with `id` as the tie-breaker
+        (api-endpoints.md 530) and is not client-selectable: a caller-chosen sort
+        column would need a matching index per column to stay a range scan, and
+        the contract names exactly one order.
+
+        Anonymised and soft-deleted rows are included: this is the
+        administrator's own view of the account table, and an invisible filter
+        would hide accounts from the one role that may need to find them. Note
+        the consequence - `AdminUserDetail` carries neither `anonymized_at` nor
+        `deleted_at`, so such a row is not visually distinct in the list and
+        announces itself only as a 409 from the PATCH. Nothing in V1 sets either
+        column (the purge job hard-deletes instead), so no row reaches that state
+        yet; revisit the schema alongside whichever slice introduces the first
+        writer.
+        """
+        stmt = select(UserModel)
+
+        if verified is True:
+            stmt = stmt.where(UserModel.email_verified_at.is_not(None))
+        elif verified is False:
+            stmt = stmt.where(UserModel.email_verified_at.is_(None))
+
+        if active is not None:
+            stmt = stmt.where(UserModel.is_active.is_(active))
+
+        if search:
+            # `email` is CITEXT, whose LIKE operator is case-insensitive, so this
+            # needs no lower() wrapper - and adding one would cast away the type
+            # and defeat any index on it. `autoescape` neutralises `%` and `_`
+            # in the search term, which are ordinary characters in an address and
+            # must not act as wildcards the caller did not ask for.
+            stmt = stmt.where(UserModel.email.contains(search, autoescape=True))
+
+        if after is not None:
+            # Row-value comparison, matching the ORDER BY below so the predicate
+            # can be satisfied by a single range scan. The `id` half is not
+            # decoration: `created_at` is not unique, and without a tie-breaker
+            # two accounts sharing a timestamp straddle a page boundary - one is
+            # served twice and the other never.
+            after_created_at, after_id = after
+            stmt = stmt.where(
+                tuple_(UserModel.created_at, UserModel.id)
+                < tuple_(
+                    # Typed literals rather than bare values: asyncpg binds
+                    # parameters with an explicit type, and an untyped datetime or
+                    # UUID here is sent as text for PostgreSQL to guess at.
+                    literal(after_created_at, DateTime(timezone=True)),
+                    literal(after_id, postgresql.UUID(as_uuid=True)),
+                )
+            )
+
+        stmt = stmt.order_by(UserModel.created_at.desc(), UserModel.id.desc()).limit(limit)
+        models = (await self._session.scalars(stmt)).all()
+        return [_user_to_domain(model) for model in models]
 
     async def get_auth_epoch(self, user_id: UUID) -> int | None:
         """The account's current authentication epoch, or None if no such user.
