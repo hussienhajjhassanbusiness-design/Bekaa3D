@@ -79,6 +79,25 @@ class User:
         self.auth_epoch += 1
         self.updated_at = at
 
+    def set_active(self, *, is_active: bool, at: datetime) -> bool:
+        """Activate or deactivate the account. Returns whether anything moved.
+
+        The boolean return is what lets the caller tell a real transition from a
+        PATCH restating the current value: only the former should end sessions
+        or write an audit row (VS-009).
+
+        Deliberately does *not* touch `auth_epoch`. Deactivation must also void
+        credentials already issued, but that is `invalidate_credentials`, and
+        keeping the two apart means this method stays usable for the
+        reactivation direction, where there is nothing to void. The use case
+        owns the decision about which transitions need both, the same way
+        `change_password` leaves session revocation to its caller."""
+        if is_active is self.is_active:
+            return False
+        self.is_active = is_active
+        self.updated_at = at
+        return True
+
 
 @dataclass
 class VerificationToken:
